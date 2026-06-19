@@ -12,6 +12,7 @@
 #include "lens.h"
 #include "version.h"
 #include "edmac.h"
+#include "patch.h"
 #include "asm.h"
 #include "beep.h"
 #include "screenshot.h"
@@ -1563,18 +1564,109 @@ static void brightness_probe_task(void)
     NotifyBox(3000, "LiveView luma probe done -> BRIGHT.TXT");
 }
 
-/* ---- EDMAC raw-channel capture: APPROACH UNDER REWORK (see eosr_port/RAW_BRINGUP_ROADMAP.md).
- *  v1 blind-MMIO scan CRASHED the R: reading an inactive 0xD04xxxxx channel block hard-faults
- *     (the old 0xD00x probe read-as-zero, but the real 0xD04x blocks fault when unclocked).
- *  v2 SetEDmac arg-hook needs patch_hook_function, which is NOT compiled for CONFIG_MMU_REMAP, so
- *     the runtime-hook path won't link on the R; the boot-time early_code_patches replay path has
- *     never actually been exercised on the R (too risky to debut on the hot SetEDmac from boot).
- *  NEXT: identify the LV raw WRITE Port statically (Ghidra imaging-pipeline trace), then read just
- *     that one channel's pBlock+0xa4 (an ACTIVE channel is clocked => safe), or build a runtime
- *     apply_patches detour of SetEDmac. Until then this menu item is a safe no-op (touches nothing). */
+/* ---- EDMAC raw-channel capture via a RUNTIME SetEDmac detour (Debug -> "EDMAC raw scan").
+ * Why a detour: the blind-MMIO scan CRASHED the R (inactive 0xD04xxxxx channel blocks hard-fault on
+ * read), and patch_hook_function isn't compiled for CONFIG_MMU_REMAP. So we use the runtime detour
+ * primitive that IS linked on the R: convert_f_patch_to_patch() + apply_patches() install an entry
+ * hook on SetEDmac @0xE0536ABC that jumps to setedmac_wrapper. The wrapper RECORDS the args
+ * (Port=r0, address=r1, b14=r2, info*=r3) -- no MMIO is touched -- then calls setedmac_tramp, which
+ * replays SetEDmac's overwritten prologue and continues the real body at +8. Installed on-demand
+ * from the menu (NOT at boot, so a battery pull recovers), captured ~1.5s in LiveView, then
+ * unpatched. Raw write channel = a WRITE Port (0..38) whose captured address is a big RAM buffer
+ * (~0x4xxxxxxx). info* lets us read geometry later. -> ML/LOGS/EDMAC.TXT */
+#define EDMAC_HOOK_NPORTS 80
+static volatile uint32_t edmac_hk_addr[EDMAC_HOOK_NPORTS];
+static volatile uint32_t edmac_hk_b14 [EDMAC_HOOK_NPORTS];
+static volatile uint32_t edmac_hk_info[EDMAC_HOOK_NPORTS];
+static volatile uint32_t edmac_hk_hits[EDMAC_HOOK_NPORTS];
+static volatile int edmac_hk_on;
+
+/* Naked trampoline: replays SetEDmac's first 8 bytes -- push {r4-r11,lr}; mov r5,r0;
+ * ldr r0,[0xe0536d58] -- relocating the pc-relative ldr to an absolute load, then jumps to
+ * SetEDmac+8 (0xE0536AC4 | thumb). r1/r2/r3 (addr/b14/info) are left untouched, exactly as the
+ * real body at +8 expects. Stack stays balanced: this push is popped by SetEDmac's own epilogue,
+ * returning into setedmac_wrapper. */
+extern void setedmac_tramp(uint32_t port, uint32_t addr, uint32_t b14, void *info);
+__attribute__((naked)) void setedmac_tramp(uint32_t port, uint32_t addr, uint32_t b14, void *info)
+{
+    asm volatile (
+        "push {r4, r5, r6, r7, r8, r9, r10, r11, lr}\n" /* = 0xE0536ABC */
+        "mov  r5, r0\n"                                  /* = 0xE0536AC0 */
+        "movw r0, #0x6d58\n"                             /* relocate ldr r0,[0xe0536d58]: */
+        "movt r0, #0xe053\n"
+        "ldr  r0, [r0]\n"                                /*   r0 = *(0xe0536d58) */
+        "movw r12, #0x6ac5\n"                            /* SetEDmac+8 | thumb bit */
+        "movt r12, #0xe053\n"
+        "bx   r12\n"
+    );
+}
+
+/* Detour target: replaces SetEDmac's entry. Record args (no MMIO), then run the real fn via tramp. */
+void setedmac_wrapper(uint32_t port, uint32_t addr, uint32_t b14, void *info);
+void setedmac_wrapper(uint32_t port, uint32_t addr, uint32_t b14, void *info)
+{
+    if (edmac_hk_on && port < EDMAC_HOOK_NPORTS)
+    {
+        edmac_hk_addr[port] = addr;
+        edmac_hk_b14 [port] = b14;
+        edmac_hk_info[port] = (uint32_t)info;
+        edmac_hk_hits[port]++;
+    }
+    setedmac_tramp(port, addr, b14, info);
+}
+
 static void edmac_scan_task(void)
 {
-    NotifyBox(5000, "EDMAC scan: reworking (see RAW_BRINGUP_ROADMAP). No MMIO touched.");
+    gui_stop_menu();
+    msleep(500);
+    for (int i = 0; i < EDMAC_HOOK_NPORTS; i++)
+        { edmac_hk_addr[i] = 0; edmac_hk_b14[i] = 0; edmac_hk_info[i] = 0; edmac_hk_hits[i] = 0; }
+    edmac_hk_on = 0;
+
+    /* install the runtime detour on SetEDmac @0xE0536ABC (orig 8 bytes:
+     * 2d e9 f0 4f = push {r4-r11,lr}; 05 46 = mov r5,r0; a5 48 = ldr r0,[0xe0536d58]) */
+    static struct function_hook_patch fhp;
+    static struct patch p;
+    static uint8_t hookmem[8];
+    fhp.patch_addr = 0xE0536ABC;
+    fhp.orig_content[0] = 0x2d; fhp.orig_content[1] = 0xe9; fhp.orig_content[2] = 0xf0; fhp.orig_content[3] = 0x4f;
+    fhp.orig_content[4] = 0x05; fhp.orig_content[5] = 0x46; fhp.orig_content[6] = 0xa5; fhp.orig_content[7] = 0x48;
+    fhp.target_function_addr = (uint32_t)&setedmac_wrapper;
+    fhp.description = "SetEDmac cap";
+    if (convert_f_patch_to_patch(&fhp, &p, hookmem))
+    {
+        NotifyBox(6000, "EDMAC: convert_f_patch failed (no detour)");
+        return;
+    }
+    int err = apply_patches(&p, 1);
+    if (err)
+    {
+        NotifyBox(6000, "EDMAC: apply_patches err=0x%x (no detour, safe)", (unsigned)err);
+        return;
+    }
+
+    edmac_hk_on = 1;
+    msleep(1500);                 /* catch ~tens of LiveView frames of channel setup */
+    edmac_hk_on = 0;
+    msleep(50);
+    unpatch_memory(0xE0536ABC);
+
+    static char b[8000]; int n = 0;
+    n += snprintf(b + n, sizeof(b) - n,
+        "SetEDmac detour capture (Port address b14 info* hits). A WRITE Port 0..38 w/ a big RAM addr = raw.\n");
+    int seen = 0;
+    for (int pp = 0; pp < EDMAC_HOOK_NPORTS && n < (int)sizeof(b) - 80; pp++)
+    {
+        if (!edmac_hk_hits[pp]) continue;
+        seen++;
+        n += snprintf(b + n, sizeof(b) - n, "P%-2d a=%08x b14=%08x info=%08x x%u\n",
+            pp, (unsigned)edmac_hk_addr[pp], (unsigned)edmac_hk_b14[pp],
+            (unsigned)edmac_hk_info[pp], (unsigned)edmac_hk_hits[pp]);
+    }
+    n += snprintf(b + n, sizeof(b) - n, "ports-seen=%d\n", seen);
+    FILE * f = FIO_CreateFile("ML/LOGS/EDMAC.TXT");
+    if (f) { FIO_WriteFile(f, b, n); FIO_CloseFile(f); }
+    NotifyBox(5000, "SetEDmac detour: %d ports -> EDMAC.TXT", seen);
 }
 #endif
 
@@ -1900,8 +1992,8 @@ static struct menu_entry debug_menus[] = {
         .name        = "EDMAC raw scan",
         .priv        = edmac_scan_task,
         .select      = run_in_separate_task,
-        .help  = "IN LIVEVIEW: hooks SetEDmac args ~1.5s to find the raw write channel.",
-        .help2 = "Toward CONFIG_RAW. Arg-capture (no MMIO poke). -> ML/LOGS/EDMAC.TXT.",
+        .help  = "IN LIVEVIEW: runtime SetEDmac detour ~1.5s to find the raw write channel.",
+        .help2 = "Toward CONFIG_RAW. Arg-capture, auto-unpatch (no MMIO poke). -> ML/LOGS/EDMAC.TXT.",
     },
 #endif
     MENU_PLACEHOLDER("Free Memory"),
