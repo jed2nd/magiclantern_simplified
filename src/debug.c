@@ -1750,6 +1750,44 @@ static void edmac_scan_task(void)
     NotifyBox(6000, "EDMAC detour: set=%d ac=%d ports=%d -> EDMAC.TXT",
               (int)edmac_hk_total, (int)edmac_hk_actotal, seen);
 }
+
+/* ---- RAW BRIGHTNESS + SCREEN-SLEEP TEST (Debug -> "Raw bright test").
+ * We found the LV raw write channel: DmacInfo Port 14 = pBlock 0xD0440000, buffer-pointer reg at
+ * +0x50, content = uncompressed Bayer. This averages that buffer over ~80s while logging a checksum,
+ * so we can answer the overnight-timelapse question: does the raw DMA keep WRITING when the display
+ * sleeps? Run it, then let the screen sleep ~halfway. If chk keeps changing after screen-off, the raw
+ * stream is display-independent (overnight-proof). avg = a brightness proxy (byte avg of packed raw).
+ * Reads the live channel reg each tick (the channel is active in LV); if a screen-off fully stops LV
+ * the reg read could fault -- the per-tick log persists, so the last entry still tells us when it died.
+ * -> ML/LOGS/RAWBR.TXT */
+#define RAW_LV_CH_BASE 0xD0440000u   /* P14 pBlock */
+#define RAW_LV_ADDR_OFF 0x50u        /* ram_addr register offset */
+static void raw_bright_task(void)
+{
+    gui_stop_menu();
+    msleep(800);
+    static char b[6000]; int n = 0;
+    n += snprintf(b + n, sizeof(b) - n,
+        "P14 raw @0xD0440000+0x50. avg(byte) + chk of 64KB, every 2s x40 (~80s).\n"
+        "LET THE SCREEN SLEEP ~halfway. chk still changing after screen-off => raw survives = overnight-proof.\n");
+    for (int t = 0; t < 40 && n < (int)sizeof(b) - 80; t++)
+    {
+        uint32_t a = *(volatile uint32_t *)(RAW_LV_CH_BASE + RAW_LV_ADDR_OFF);  /* live buffer ptr */
+        uint32_t avg = 0, chk = 0;
+        if (a >= 0x01000000 && a < 0x20000000)
+        {
+            const volatile uint8_t * p = (const volatile uint8_t *)a;
+            uint32_t sum = 0;
+            for (int i = 0; i < 0x10000; i += 16) { uint8_t v = p[i]; sum += v; chk = chk * 31 + v; }
+            avg = sum / (0x10000 / 16);
+        }
+        n += snprintf(b + n, sizeof(b) - n, "t=%d buf=%08x avg=%d chk=%08x\n", t, (unsigned)a, (int)avg, (unsigned)chk);
+        FILE * f = FIO_CreateFile("ML/LOGS/RAWBR.TXT");
+        if (f) { FIO_WriteFile(f, b, n); FIO_CloseFile(f); }
+        msleep(2000);
+    }
+    NotifyBox(4000, "Raw bright test done -> RAWBR.TXT");
+}
 #endif
 
 #ifdef FEATURE_DEBUG_PROP_DISPLAY
@@ -2076,6 +2114,13 @@ static struct menu_entry debug_menus[] = {
         .select      = run_in_separate_task,
         .help  = "IN LIVEVIEW: runtime SetEDmac detour ~1.5s to find the raw write channel.",
         .help2 = "Toward CONFIG_RAW. Arg-capture, auto-unpatch (no MMIO poke). -> ML/LOGS/EDMAC.TXT.",
+    },
+    {
+        .name        = "Raw bright test",
+        .priv        = raw_bright_task,
+        .select      = run_in_separate_task,
+        .help  = "IN LIVEVIEW: avg+chksum the P14 raw buffer 80s. LET SCREEN SLEEP halfway.",
+        .help2 = "Tests if raw DMA survives screen-off (overnight timelapse). -> ML/LOGS/RAWBR.TXT.",
     },
 #endif
     MENU_PLACEHOLDER("Free Memory"),
