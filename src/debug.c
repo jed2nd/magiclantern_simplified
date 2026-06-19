@@ -1580,6 +1580,7 @@ static volatile uint32_t edmac_hk_b14 [EDMAC_HOOK_NPORTS];
 static volatile uint32_t edmac_hk_info[EDMAC_HOOK_NPORTS];
 static volatile uint32_t edmac_hk_hits[EDMAC_HOOK_NPORTS];
 static volatile int edmac_hk_on;
+static volatile uint32_t edmac_hk_total;   /* every wrapper call while patched -- proves the hook is live */
 
 /* Naked trampoline: replays SetEDmac's first 8 bytes -- push {r4-r11,lr}; mov r5,r0;
  * ldr r0,[0xe0536d58] -- relocating the pc-relative ldr to an absolute load, then jumps to
@@ -1605,6 +1606,7 @@ __attribute__((naked)) void setedmac_tramp(uint32_t port, uint32_t addr, uint32_
 void setedmac_wrapper(uint32_t port, uint32_t addr, uint32_t b14, void *info);
 void setedmac_wrapper(uint32_t port, uint32_t addr, uint32_t b14, void *info)
 {
+    edmac_hk_total++;   /* unconditional: proves SetEDmac is actually flowing through us */
     if (edmac_hk_on && port < EDMAC_HOOK_NPORTS)
     {
         edmac_hk_addr[port] = addr;
@@ -1622,6 +1624,7 @@ static void edmac_scan_task(void)
     for (int i = 0; i < EDMAC_HOOK_NPORTS; i++)
         { edmac_hk_addr[i] = 0; edmac_hk_b14[i] = 0; edmac_hk_info[i] = 0; edmac_hk_hits[i] = 0; }
     edmac_hk_on = 0;
+    edmac_hk_total = 0;
 
     /* install the runtime detour on SetEDmac @0xE0536ABC (orig 8 bytes:
      * 2d e9 f0 4f = push {r4-r11,lr}; 05 46 = mov r5,r0; a5 48 = ldr r0,[0xe0536d58]) */
@@ -1644,16 +1647,23 @@ static void edmac_scan_task(void)
         NotifyBox(6000, "EDMAC: apply_patches err=0x%x (no detour, safe)", (unsigned)err);
         return;
     }
+    /* read back the patched entry: if the patch took, this is the hook (ldr.w pc,[pc] = 0xf000f8df) */
+    uint32_t patched = *(volatile uint32_t *)0xE0536ABC;
 
+    /* SetEDmac fires when the LV pipeline is (re)configured, not every frame -- so prompt the user to
+     * force a reconfigure (zoom) during a long window. */
     edmac_hk_on = 1;
-    msleep(1500);                 /* catch ~tens of LiveView frames of channel setup */
+    NotifyBox(11000, "CAPTURING 12s: ZOOM LiveView in then out NOW (or toggle photo/video)");
+    msleep(12000);
     edmac_hk_on = 0;
     msleep(50);
     unpatch_memory(0xE0536ABC);
 
     static char b[8000]; int n = 0;
     n += snprintf(b + n, sizeof(b) - n,
-        "SetEDmac detour capture (Port address b14 info* hits). A WRITE Port 0..38 w/ a big RAM addr = raw.\n");
+        "SetEDmac detour: total_calls=%u  patched_entry=%08x (hook ok if f000f8df)\n"
+        "Port address b14 info* hits. A WRITE Port 0..38 w/ a big RAM addr = raw.\n",
+        (unsigned)edmac_hk_total, (unsigned)patched);
     int seen = 0;
     for (int pp = 0; pp < EDMAC_HOOK_NPORTS && n < (int)sizeof(b) - 80; pp++)
     {
@@ -1666,7 +1676,7 @@ static void edmac_scan_task(void)
     n += snprintf(b + n, sizeof(b) - n, "ports-seen=%d\n", seen);
     FILE * f = FIO_CreateFile("ML/LOGS/EDMAC.TXT");
     if (f) { FIO_WriteFile(f, b, n); FIO_CloseFile(f); }
-    NotifyBox(5000, "SetEDmac detour: %d ports -> EDMAC.TXT", seen);
+    NotifyBox(6000, "SetEDmac detour: total=%u ports=%d -> EDMAC.TXT", (unsigned)edmac_hk_total, seen);
 }
 #endif
 
