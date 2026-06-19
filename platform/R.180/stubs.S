@@ -363,17 +363,23 @@ DATA_PTR(   0x13874,  LiveViewApp_dialog)                   // in StartLiveViewA
 // THUMB_FN(0xE05478A6,  UnLockEngineResources)              // Takes LockEntry as input, releases semaphore from LockEntry content
 
 /** EDMAC **/
+// Resolved 2026-06 via Ghidra decompiler. Driver = Engine::Edmac.c (assert str 0xE0535D34).
+// DmacInfo[Port] const table @0xE0DD5C64 (8-byte {uint32 pBlock; uint16 ModeInfo; uint16}); ELD_EDMAC_NUM~76.
+// ModeInfo: TYPE_WRITE=0x01, TYPE_READ=0x02, DIV_MODE=0x800, XSYS_DIV=0x1000. Channel MMIO blocks @0xD04xxxxx.
+// Left COMMENTED on purpose: function_overrides.c has no-op placeholders for these, and nothing on
+// the R should call the real Canon EDMAC yet. Addresses are confirmed-from-decompilation, ready to
+// activate once edmac.c is wired (remember to delete the function_overrides.c placeholder then).
 // THUMB_FN(0x,  AbortEDmac)
-// THUMB_FN(0x,  ConnectReadEDmac)
-// THUMB_FN(0x,  ConnectWriteEDmac)
+// THUMB_FN(0xE05360C8,  ConnectReadEDmac)                    // asserts TYPE_READ; routes Port->DmacBoomerInfo[Port] via FUN_e05329b0
+// THUMB_FN(0xE053607C,  ConnectWriteEDmac)                   // asserts TYPE_WRITE; DmacBoomerInfo[] table @ ptr in 0xE05361F8 (stride 0xc)
 // THUMB_FN(0x,  RegisterEDmacAbortCBR)
 // THUMB_FN(0x,  UnregisterEDmacAbortCBR)
-// THUMB_FN(0xE0535A82,  RegisterEDmacCompleteCBR)            // Not sure. Many registered CBRs have "CompCBR" in debug print names
-// THUMB_FN(0xE0535E16,  UnregisterEDmacCompleteCBR)          // Uses same data structure as above. Replaces CBR with pointer to "do nothing" function.
+// THUMB_FN(0xE0535A82,  RegisterEDmacCompleteCBR)            // SUSPECT: 0xE0535A82 is in Engine/FigoOut.c, not Edmac.c. Real CompCBR likely in EdmacChaser.c (~0xE039Axxx). TBD.
+// THUMB_FN(0xE0535E16,  UnregisterEDmacCompleteCBR)          // SUSPECT (same FigoOut.c region). Re-verify before use.
 // THUMB_FN(0x,  RegisterEDmacPopCBR)
 // THUMB_FN(0x,  UnregisterEDmacPopCBR)
-// THUMB_FN(0x,  SetEDmac)
-// THUMB_FN(0x,  StartEDmac)
+// THUMB_FN(0xE0536ABC,  SetEDmac)                            // SetEDmac(Port, addr, b14, edmac_info*): addr->pBlock+0xa4 (&~1), b14->+0xa8 (&0x3fff), geometry +0x48..0x9c. Buffer-addr write lives here.
+// THUMB_FN(0x,  StartEDmac)                                  // TBD (write-chan enable reg). Read-chan ctrl seen at 0xE0536116(+0xb4=2)/0xE0536142(=0).
 
 /*
  * Stubs needed only for experiments in test_features.c
