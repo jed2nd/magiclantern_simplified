@@ -1647,7 +1647,7 @@ void edmac_ab0_wrapper(uint32_t port, uint32_t value)
         if (value) edmac_hk_acval[port] = value;
         /* dump the whole channel block once it's SETTLED (8th update -- not the 1st, which is often
          * before SetEDmac has configured it). Read the full 0x00..0xFC (stride is 0x100). */
-        if (!edmac_hk_scanned[port] && edmac_hk_achits[port] == 8)
+        if (!edmac_hk_scanned[port] && edmac_hk_achits[port] == 4)
         {
             edmac_hk_scanned[port] = 1;
             for (int w = 0; w < 64; w++)
@@ -1729,6 +1729,20 @@ static void edmac_scan_task(void)
             if (edmac_hk_dump[pp][w])
                 n += snprintf(b + n, sizeof(b) - n, " %x:%08x", w * 4, (unsigned)edmac_hk_dump[pp][w]);
         n += snprintf(b + n, sizeof(b) - n, "\n");
+        /* find a buffer pointer (clean word-aligned value in safe RAM range) and peek 8 words of it,
+         * so its content tells us what the channel carries (raw Bayer vs YUV vs stats). */
+        for (int w = 0; w < 64; w++)
+        {
+            uint32_t v = edmac_hk_dump[pp][w];
+            if (v >= 0x01000000 && v < 0x20000000 && (v & 3) == 0)
+            {
+                n += snprintf(b + n, sizeof(b) - n, "  buf@%x=%08x mem:", w * 4, (unsigned)v);
+                for (int k = 0; k < 8 && n < (int)sizeof(b) - 12; k++)
+                    n += snprintf(b + n, sizeof(b) - n, " %08x", (unsigned)*(volatile uint32_t *)(v + k * 4));
+                n += snprintf(b + n, sizeof(b) - n, "\n");
+                break;
+            }
+        }
     }
     n += snprintf(b + n, sizeof(b) - n, "ports-seen=%d\n", seen);
     FILE * f = FIO_CreateFile("ML/LOGS/EDMAC.TXT");
