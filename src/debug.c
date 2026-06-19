@@ -1563,63 +1563,18 @@ static void brightness_probe_task(void)
     NotifyBox(3000, "LiveView luma probe done -> BRIGHT.TXT");
 }
 
-/* ---- EDMAC SCAN (Debug -> "EDMAC raw scan"). Toward CONFIG_RAW on the R: raw.c reads the raw buffer
- * address out of an EDMAC channel's address register. GROUND TRUTH (Ghidra RE of Engine::Edmac.c):
- *   - SetEDmac @0xE0536ABC writes the DMA buffer address to  pBlock + 0xa4.
- *   - DmacInfo[Port] const table @0xE0DD5C64: 8-byte {uint32 pBlock; uint16 ModeInfo; ...}.
- *   - ModeInfo bit0 = TYPE_WRITE, bit1 = TYPE_READ. Channel MMIO blocks live at 0xD04xxxxx
- *     (the earlier 0xD00X2800 guess was wrong -- that read all-zeros).
- * wblk[] below = every WRITE channel's pBlock (Ports 0..38, the bit0 entries from the table).
- * This reads pBlock+0xa4 for each, live, IN LIVEVIEW. The sensor->RAM raw channel should show a big
- * RAM address (~0x4xxxxxxx). Also dumps +0x48/+0x4c (geometry) for any active channel so we can read
- * off raw dimensions. Read-only MMIO; if direct read-back is shadowed (all zero despite a live image),
- * that tells us we need the SetEDmac detour instead. -> ML/LOGS/EDMAC.TXT */
+/* ---- EDMAC raw-channel capture: APPROACH UNDER REWORK (see eosr_port/RAW_BRINGUP_ROADMAP.md).
+ *  v1 blind-MMIO scan CRASHED the R: reading an inactive 0xD04xxxxx channel block hard-faults
+ *     (the old 0xD00x probe read-as-zero, but the real 0xD04x blocks fault when unclocked).
+ *  v2 SetEDmac arg-hook needs patch_hook_function, which is NOT compiled for CONFIG_MMU_REMAP, so
+ *     the runtime-hook path won't link on the R; the boot-time early_code_patches replay path has
+ *     never actually been exercised on the R (too risky to debut on the hot SetEDmac from boot).
+ *  NEXT: identify the LV raw WRITE Port statically (Ghidra imaging-pipeline trace), then read just
+ *     that one channel's pBlock+0xa4 (an ACTIVE channel is clocked => safe), or build a runtime
+ *     apply_patches detour of SetEDmac. Until then this menu item is a safe no-op (touches nothing). */
 static void edmac_scan_task(void)
 {
-    static const uint32_t wblk[] = {
-        0xd0404000,0xd0420000,0xd0420100,0xd0420200,0xd0420300,0xd0420400,0xd0420500,0xd0420600,
-        0xd0420700,0xd0420800,0xd0420900,0xd0420a00,0xd0420b00,0xd0420c00,0xd0440000,0xd0440100,
-        0xd0440200,0xd045e000,0xd045e100,0xd045e200,0xd0474000,0xd0471000,0xd0471100,0xd0487000,
-        0xd0487100,0xd0487200,0xd04a2000,0xd04a2100,0xd04a2200,0xd04a2300,0xd04a2400,0xd04a2500,
-        0xd04a7000,0xd04c0000,0xd04c0100,0xd04c0200,0xd04c1000,0xd04c1100,0xd04c1200,
-    };
-    const int nb = (int)(sizeof(wblk) / sizeof(wblk[0]));
-    static char b[8000]; int n = 0;
-    gui_stop_menu();
-    msleep(500);
-    n += snprintf(b + n, sizeof(b) - n,
-        "EDMAC WRITE chans (addr reg = pBlock+0xa4; DmacInfo@0xE0DD5C64). IN LIVEVIEW. Big RAM addr = raw.\nIdx->pBlock: ");
-    for (int i = 0; i < nb; i++)
-        n += snprintf(b + n, sizeof(b) - n, "%d:%08x ", i, (unsigned)wblk[i]);
-    n += snprintf(b + n, sizeof(b) - n, "\n");
-    for (int it = 0; it < 8 && n < (int)sizeof(b) - 700; it++)
-    {
-        n += snprintf(b + n, sizeof(b) - n, "t=%d addr[a4]:", it);
-        for (int i = 0; i < nb; i++)
-        {
-            uint32_t a = *(volatile uint32_t *)(wblk[i] + 0xa4);
-            n += snprintf(b + n, sizeof(b) - n, " %08x", (unsigned)a);
-        }
-        n += snprintf(b + n, sizeof(b) - n, "\n");
-        /* for any channel with a non-zero address, dump geometry to start format RE */
-        for (int i = 0; i < nb && n < (int)sizeof(b) - 120; i++)
-        {
-            uint32_t a = *(volatile uint32_t *)(wblk[i] + 0xa4);
-            if (a)
-            {
-                uint32_t s48 = *(volatile uint32_t *)(wblk[i] + 0x48);
-                uint32_t s4c = *(volatile uint32_t *)(wblk[i] + 0x4c);
-                uint32_t a8  = *(volatile uint32_t *)(wblk[i] + 0xa8);
-                n += snprintf(b + n, sizeof(b) - n,
-                    "  ACTIVE P%d %08x a=%08x a8=%08x s48=%08x s4c=%08x\n",
-                    i, (unsigned)wblk[i], (unsigned)a, (unsigned)a8, (unsigned)s48, (unsigned)s4c);
-            }
-        }
-        FILE * f = FIO_CreateFile("ML/LOGS/EDMAC.TXT");
-        if (f) { FIO_WriteFile(f, b, n); FIO_CloseFile(f); }
-        msleep(800);
-    }
-    NotifyBox(3000, "EDMAC scan done -> EDMAC.TXT");
+    NotifyBox(5000, "EDMAC scan: reworking (see RAW_BRINGUP_ROADMAP). No MMIO touched.");
 }
 #endif
 
@@ -1945,8 +1900,8 @@ static struct menu_entry debug_menus[] = {
         .name        = "EDMAC raw scan",
         .priv        = edmac_scan_task,
         .select      = run_in_separate_task,
-        .help  = "IN LIVEVIEW: reads the R's EDMAC channel regs, hunting the raw buffer.",
-        .help2 = "Toward CONFIG_RAW (camera-free brightness). Read-only. -> ML/LOGS/EDMAC.TXT.",
+        .help  = "IN LIVEVIEW: hooks SetEDmac args ~1.5s to find the raw write channel.",
+        .help2 = "Toward CONFIG_RAW. Arg-capture (no MMIO poke). -> ML/LOGS/EDMAC.TXT.",
     },
 #endif
     MENU_PLACEHOLDER("Free Memory"),
