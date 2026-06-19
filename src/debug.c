@@ -1765,27 +1765,35 @@ static void edmac_scan_task(void)
 static void raw_bright_task(void)
 {
     gui_stop_menu();
-    msleep(800);
-    static char b[6000]; int n = 0;
+    msleep(300);
+    /* read the buffer pointer ONCE (channel active now), then read the BUFFER (RAM) each tick -- RAM
+     * never deactivates, so a screen-sleep can't fault the read; chk just freezes if the DMA stops. */
+    uint32_t bufaddr = *(volatile uint32_t *)(RAW_LV_CH_BASE + RAW_LV_ADDR_OFF);
+    static char b[4000]; int n = 0;
     n += snprintf(b + n, sizeof(b) - n,
-        "P14 raw @0xD0440000+0x50. avg(byte) + chk of 64KB, every 2s x40 (~80s).\n"
-        "LET THE SCREEN SLEEP ~halfway. chk still changing after screen-off => raw survives = overnight-proof.\n");
-    for (int t = 0; t < 40 && n < (int)sizeof(b) - 80; t++)
+        "P14 raw buf=%08x. avg(byte)+chk of 64KB every 250ms x80 (~20s). LV sleeps ~2-5s in.\n"
+        "chk STILL CHANGING after the sleep => raw DMA is display-independent = overnight-proof.\n",
+        (unsigned)bufaddr);
+    if (bufaddr < 0x01000000 || bufaddr >= 0x20000000)
     {
-        uint32_t a = *(volatile uint32_t *)(RAW_LV_CH_BASE + RAW_LV_ADDR_OFF);  /* live buffer ptr */
-        uint32_t avg = 0, chk = 0;
-        if (a >= 0x01000000 && a < 0x20000000)
-        {
-            const volatile uint8_t * p = (const volatile uint8_t *)a;
-            uint32_t sum = 0;
-            for (int i = 0; i < 0x10000; i += 16) { uint8_t v = p[i]; sum += v; chk = chk * 31 + v; }
-            avg = sum / (0x10000 / 16);
-        }
-        n += snprintf(b + n, sizeof(b) - n, "t=%d buf=%08x avg=%d chk=%08x\n", t, (unsigned)a, (int)avg, (unsigned)chk);
-        FILE * f = FIO_CreateFile("ML/LOGS/RAWBR.TXT");
-        if (f) { FIO_WriteFile(f, b, n); FIO_CloseFile(f); }
-        msleep(2000);
+        NotifyBox(6000, "Raw bright: bad buf ptr %08x (LV not active?)", (unsigned)bufaddr);
+        return;
     }
+    const volatile uint8_t * p = (const volatile uint8_t *)bufaddr;
+    for (int t = 0; t < 80 && n < (int)sizeof(b) - 48; t++)
+    {
+        uint32_t sum = 0, chk = 0;
+        for (int i = 0; i < 0x10000; i += 16) { uint8_t v = p[i]; sum += v; chk = chk * 31 + v; }
+        n += snprintf(b + n, sizeof(b) - n, "t=%d avg=%d chk=%08x\n", t, (int)(sum / (0x10000 / 16)), (unsigned)chk);
+        if ((t & 3) == 0)   /* flush every ~1s */
+        {
+            FILE * f = FIO_CreateFile("ML/LOGS/RAWBR.TXT");
+            if (f) { FIO_WriteFile(f, b, n); FIO_CloseFile(f); }
+        }
+        msleep(250);
+    }
+    FILE * f = FIO_CreateFile("ML/LOGS/RAWBR.TXT");
+    if (f) { FIO_WriteFile(f, b, n); FIO_CloseFile(f); }
     NotifyBox(4000, "Raw bright test done -> RAWBR.TXT");
 }
 #endif
