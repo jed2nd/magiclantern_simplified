@@ -37,9 +37,14 @@
  * calc_mmu_globals already aligns the L1 table / 64KB page WITHIN this buffer (via start_adjust),
  * so the buffer itself needs NO 0x10000 alignment -- just MMU_PAGE_SIZE of slack for that internal
  * alignment. Dropping the attribute removes the padding while keeping the remap functional. */
-static uint8_t generic_mmu_space[MMU_PAGE_SIZE + MMU_L1_TABLE_SIZE
-                                 + 0x300 + MMU_L2_TABLE_SIZE
-                                 + sizeof(struct mmu_L2_page_info)
+/* 2026-06-19 R: sized for TWO remapped 64KB pages (+ 2 L2 tables), not one. The boot remap consumes
+ * the first page/L2, so the original 1-page buffer left nothing for a RUNTIME apply_patches() of a
+ * new 1MB region -> E_PATCH_BAD_MMU_PAGE (0x800). The 2nd page/L2 lets us install a runtime detour on
+ * SetEDmac @0xE0536ABC (0xE0500000 region) for the EDMAC raw-channel probe. calc_mmu_globals() backs
+ * num_64k_pages off to fit, so this robustly yields 2. Cost ~+66KB BSS (well within the R's budget). */
+static uint8_t generic_mmu_space[2 * MMU_PAGE_SIZE + MMU_L1_TABLE_SIZE
+                                 + 0x300 + 2 * MMU_L2_TABLE_SIZE
+                                 + 2 * sizeof(struct mmu_L2_page_info)
                                  + MMU_PAGE_SIZE /* slack for internal 64KB alignment */];
 #endif
 
