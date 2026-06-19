@@ -1562,6 +1562,43 @@ static void brightness_probe_task(void)
     }
     NotifyBox(3000, "LiveView luma probe done -> BRIGHT.TXT");
 }
+
+/* ---- EDMAC SCAN (Debug -> "EDMAC raw scan"). Toward CONFIG_RAW on the R: raw.c reads the raw buffer
+ * address out of an EDMAC channel register. ROM literal-pool analysis put the R's EDMAC at 4
+ * controllers @ 0xD00X0000 (X=0..3), channel regs near +0x2800/+0x2900/+0x4200 (the heavily-referenced
+ * 0xD0032800/0xD0012800/... = the D8 EDMAC, moved up from the old 0xC0F0xxxx). This reads those
+ * candidate registers live, a few times, IN LIVEVIEW. We're hunting a register holding a RAM buffer
+ * address (~0x4xxxxxxx) that's image/raw-sized -- that channel is the raw EDMAC we wire into raw.c.
+ * Read-only MMIO (Canon reads these constantly); if it ever hangs, a battery pull recovers it.
+ * -> ML/LOGS/EDMAC.TXT */
+static void edmac_scan_task(void)
+{
+    static const uint32_t regs[] = {
+        0xd0002800, 0xd0002900, 0xd0004200,
+        0xd0012800, 0xd0012900, 0xd0014200,
+        0xd0022800, 0xd0022900, 0xd0024200,
+        0xd0032800, 0xd0032900, 0xd0034200,
+    };
+    static char b[5000]; int n = 0;
+    gui_stop_menu();
+    msleep(500);
+    n += snprintf(b + n, sizeof(b) - n,
+        "EDMAC channel regs (D8 base 0xD00X0000). Run IN LIVEVIEW. Hunting a RAM buffer addr (~0x4xxxxxxx):\n");
+    for (int it = 0; it < 6 && n < (int)sizeof(b) - 420; it++)
+    {
+        n += snprintf(b + n, sizeof(b) - n, "t=%d ", it);
+        for (int i = 0; i < (int)(sizeof(regs) / sizeof(regs[0])); i++)
+        {
+            uint32_t v = *(volatile uint32_t *)regs[i];
+            n += snprintf(b + n, sizeof(b) - n, "%08x=%08x ", (unsigned)regs[i], (unsigned)v);
+        }
+        n += snprintf(b + n, sizeof(b) - n, "\n");
+        FILE * f = FIO_CreateFile("ML/LOGS/EDMAC.TXT");
+        if (f) { FIO_WriteFile(f, b, n); FIO_CloseFile(f); }
+        msleep(1200);
+    }
+    NotifyBox(3000, "EDMAC scan done -> EDMAC.TXT");
+}
 #endif
 
 #ifdef FEATURE_DEBUG_PROP_DISPLAY
@@ -1881,6 +1918,13 @@ static struct menu_entry debug_menus[] = {
         .select      = run_in_separate_task,
         .help  = "LIVEVIEW + vary light (~2.5min, passive): logs PROP_LV_BV vs the scene.",
         .help2 = "Finds a metering signal for adaptive-exposure timelapse. -> BRIGHT.TXT.",
+    },
+    {
+        .name        = "EDMAC raw scan",
+        .priv        = edmac_scan_task,
+        .select      = run_in_separate_task,
+        .help  = "IN LIVEVIEW: reads the R's EDMAC channel regs, hunting the raw buffer.",
+        .help2 = "Toward CONFIG_RAW (camera-free brightness). Read-only. -> ML/LOGS/EDMAC.TXT.",
     },
 #endif
     MENU_PLACEHOLDER("Free Memory"),
