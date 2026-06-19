@@ -1589,12 +1589,8 @@ static volatile uint32_t edmac_hk_acval[EDMAC_HOOK_NPORTS];   /* +0xac value (sm
 static volatile uint32_t edmac_hk_achits[EDMAC_HOOK_NPORTS];
 static volatile uint32_t edmac_hk_actotal;
 static volatile uint8_t  edmac_hk_scanned[EDMAC_HOOK_NPORTS];
-static volatile uint32_t edmac_hk_boff1[EDMAC_HOOK_NPORTS];   /* offset of 1st RAM-looking reg */
-static volatile uint32_t edmac_hk_bval1[EDMAC_HOOK_NPORTS];   /* its value (buffer candidate) */
-static volatile uint32_t edmac_hk_boff2[EDMAC_HOOK_NPORTS];   /* 2nd RAM-looking reg */
-static volatile uint32_t edmac_hk_bval2[EDMAC_HOOK_NPORTS];
-static volatile uint32_t edmac_hk_ys[EDMAC_HOOK_NPORTS];      /* reg 0x48 (ys_xs) */
-static volatile uint32_t edmac_hk_yn[EDMAC_HOOK_NPORTS];      /* reg 0x54 (yn_xn) */
+/* full register dump of the (settled) live channel block; stride is 0x100 -> 64 words 0x00..0xFC */
+static volatile uint32_t edmac_hk_dump[EDMAC_HOOK_NPORTS][64];
 
 /* Naked trampoline: replays SetEDmac's first 8 bytes -- push {r4-r11,lr}; mov r5,r0;
  * ldr r0,[0xe0536d58] -- relocating the pc-relative ldr to an absolute load, then jumps to
@@ -1649,22 +1645,13 @@ void edmac_ab0_wrapper(uint32_t port, uint32_t value)
     {
         edmac_hk_achits[port]++;
         if (value) edmac_hk_acval[port] = value;
-        /* scan the live channel once: find RAM-buffer-looking registers + grab geometry */
-        if (!edmac_hk_scanned[port])
+        /* dump the whole channel block once it's SETTLED (8th update -- not the 1st, which is often
+         * before SetEDmac has configured it). Read the full 0x00..0xFC (stride is 0x100). */
+        if (!edmac_hk_scanned[port] && edmac_hk_achits[port] == 8)
         {
             edmac_hk_scanned[port] = 1;
-            edmac_hk_ys[port] = *(volatile uint32_t *)(pblock + 0x48);
-            edmac_hk_yn[port] = *(volatile uint32_t *)(pblock + 0x54);
-            int found = 0;
-            for (int off = 0x40; off <= 0xFC; off += 4)
-            {
-                uint32_t v = *(volatile uint32_t *)(pblock + off);
-                if (v >= 0x10000000 && v < 0x80000000)
-                {
-                    if (found == 0) { edmac_hk_boff1[port] = off; edmac_hk_bval1[port] = v; found = 1; }
-                    else { edmac_hk_boff2[port] = off; edmac_hk_bval2[port] = v; break; }
-                }
-            }
+            for (int w = 0; w < 64; w++)
+                edmac_hk_dump[port][w] = *(volatile uint32_t *)(pblock + w * 4);
         }
     }
     /* replicate FUN_e0536ab0 exactly: *(DmacInfo[port].pBlock + 0xac) = value */
@@ -1679,8 +1666,7 @@ static void edmac_scan_task(void)
     {
         edmac_hk_addr[i] = 0; edmac_hk_b14[i] = 0; edmac_hk_info[i] = 0; edmac_hk_hits[i] = 0;
         edmac_hk_acval[i] = 0; edmac_hk_achits[i] = 0; edmac_hk_scanned[i] = 0;
-        edmac_hk_boff1[i] = 0; edmac_hk_bval1[i] = 0; edmac_hk_boff2[i] = 0; edmac_hk_bval2[i] = 0;
-        edmac_hk_ys[i] = 0; edmac_hk_yn[i] = 0;
+        for (int w = 0; w < 64; w++) edmac_hk_dump[i][w] = 0;
     }
     edmac_hk_on = 0;
     edmac_hk_total = 0;
@@ -1727,23 +1713,22 @@ static void edmac_scan_task(void)
     unpatch_memory(0xE0536ABC);
     unpatch_memory(0xE0536AB0);
 
-    static char b[8000]; int n = 0;
+    static char b[14000]; int n = 0;
     /* ML snprintf supports %d/%x/%08x but NOT %u or width/flag forms like %-2d -- use only %d/%x. */
     n += snprintf(b + n, sizeof(b) - n,
         "SetEDmac total=%d  +0xac total=%d  (entries %08x/%08x, hook ok if f000f8df)\n"
-        "Live-channel scan: ram1@off=value is the buffer (RAM ptr 0x1xxxxxxx-0x7xxxxxxx). ys=0x48 yn=0x54.\n",
+        "Full settled-channel reg dump (off:val, non-zero only). Buffer = a clean RAM ptr (not (X<<16)|small).\n",
         (int)edmac_hk_total, (int)edmac_hk_actotal, (unsigned)patched0, (unsigned)patched1);
     int seen = 0;
-    for (int pp = 0; pp < EDMAC_HOOK_NPORTS && n < (int)sizeof(b) - 130; pp++)
+    for (int pp = 0; pp < EDMAC_HOOK_NPORTS && n < (int)sizeof(b) - 260; pp++)
     {
-        if (!edmac_hk_hits[pp] && !edmac_hk_achits[pp]) continue;
+        if (!edmac_hk_achits[pp]) continue;
         seen++;
-        n += snprintf(b + n, sizeof(b) - n,
-            "P%d ram1[%x]=%08x ram2[%x]=%08x ys=%08x yn=%08x acidx=%x ach=%d\n",
-            pp, (unsigned)edmac_hk_boff1[pp], (unsigned)edmac_hk_bval1[pp],
-            (unsigned)edmac_hk_boff2[pp], (unsigned)edmac_hk_bval2[pp],
-            (unsigned)edmac_hk_ys[pp], (unsigned)edmac_hk_yn[pp],
-            (unsigned)edmac_hk_acval[pp], (int)edmac_hk_achits[pp]);
+        n += snprintf(b + n, sizeof(b) - n, "P%d ach=%d:", pp, (int)edmac_hk_achits[pp]);
+        for (int w = 0; w < 64 && n < (int)sizeof(b) - 24; w++)
+            if (edmac_hk_dump[pp][w])
+                n += snprintf(b + n, sizeof(b) - n, " %x:%08x", w * 4, (unsigned)edmac_hk_dump[pp][w]);
+        n += snprintf(b + n, sizeof(b) - n, "\n");
     }
     n += snprintf(b + n, sizeof(b) - n, "ports-seen=%d\n", seen);
     FILE * f = FIO_CreateFile("ML/LOGS/EDMAC.TXT");
