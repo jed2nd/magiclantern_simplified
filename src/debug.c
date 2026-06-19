@@ -1609,10 +1609,15 @@ void setedmac_wrapper(uint32_t port, uint32_t addr, uint32_t b14, void *info)
     edmac_hk_total++;   /* unconditional: proves SetEDmac is actually flowing through us */
     if (edmac_hk_on && port < EDMAC_HOOK_NPORTS)
     {
-        edmac_hk_addr[port] = addr;
-        edmac_hk_b14 [port] = b14;
-        edmac_hk_info[port] = (uint32_t)info;
         edmac_hk_hits[port]++;
+        /* keep the last NON-ZERO buffer setup; addr==0 is a channel teardown/clear (e.g. zoom-out)
+         * and must not overwrite the real buffer we're hunting. */
+        if (addr)
+        {
+            edmac_hk_addr[port] = addr;
+            edmac_hk_b14 [port] = b14;
+            edmac_hk_info[port] = (uint32_t)info;
+        }
     }
     setedmac_tramp(port, addr, b14, info);
 }
@@ -1660,18 +1665,19 @@ static void edmac_scan_task(void)
     unpatch_memory(0xE0536ABC);
 
     static char b[8000]; int n = 0;
+    /* ML snprintf supports %d/%x/%08x but NOT %u or width/flag forms like %-2d -- use only %d/%x. */
     n += snprintf(b + n, sizeof(b) - n,
-        "SetEDmac detour: total_calls=%u  patched_entry=%08x (hook ok if f000f8df)\n"
-        "Port address b14 info* hits. A WRITE Port 0..38 w/ a big RAM addr = raw.\n",
-        (unsigned)edmac_hk_total, (unsigned)patched);
+        "SetEDmac detour: total_calls=%d  patched_entry=%08x (hook ok if f000f8df)\n"
+        "Port address(last non-zero) b14 info* hits. A WRITE Port 0..38 w/ a big RAM addr = raw.\n",
+        (int)edmac_hk_total, (unsigned)patched);
     int seen = 0;
     for (int pp = 0; pp < EDMAC_HOOK_NPORTS && n < (int)sizeof(b) - 80; pp++)
     {
         if (!edmac_hk_hits[pp]) continue;
         seen++;
-        n += snprintf(b + n, sizeof(b) - n, "P%-2d a=%08x b14=%08x info=%08x x%u\n",
+        n += snprintf(b + n, sizeof(b) - n, "P%d a=%08x b14=%08x info=%08x hits=%d\n",
             pp, (unsigned)edmac_hk_addr[pp], (unsigned)edmac_hk_b14[pp],
-            (unsigned)edmac_hk_info[pp], (unsigned)edmac_hk_hits[pp]);
+            (unsigned)edmac_hk_info[pp], (int)edmac_hk_hits[pp]);
     }
     n += snprintf(b + n, sizeof(b) - n, "ports-seen=%d\n", seen);
     FILE * f = FIO_CreateFile("ML/LOGS/EDMAC.TXT");
