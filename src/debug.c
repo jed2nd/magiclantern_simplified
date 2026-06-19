@@ -1581,6 +1581,11 @@ static volatile uint32_t edmac_hk_info[EDMAC_HOOK_NPORTS];
 static volatile uint32_t edmac_hk_hits[EDMAC_HOOK_NPORTS];
 static volatile int edmac_hk_on;
 static volatile uint32_t edmac_hk_total;   /* every wrapper call while patched -- proves the hook is live */
+/* FUN_e0536ab0(port, value) writes value -> pBlock+0xac: the real DMA buffer-pointer register
+ * (SetEDmac's +0xa4 arg was always a small value/0). Capture its value per port. */
+static volatile uint32_t edmac_hk_acval[EDMAC_HOOK_NPORTS];   /* last non-zero value -> pBlock+0xac */
+static volatile uint32_t edmac_hk_achits[EDMAC_HOOK_NPORTS];
+static volatile uint32_t edmac_hk_actotal;
 
 /* Naked trampoline: replays SetEDmac's first 8 bytes -- push {r4-r11,lr}; mov r5,r0;
  * ldr r0,[0xe0536d58] -- relocating the pc-relative ldr to an absolute load, then jumps to
@@ -1622,67 +1627,100 @@ void setedmac_wrapper(uint32_t port, uint32_t addr, uint32_t b14, void *info)
     setedmac_tramp(port, addr, b14, info);
 }
 
+/* Detour target for FUN_e0536ab0 @0xE0536AB0 -- a leaf that does *(DmacInfo[port].pBlock+0xac)=value.
+ * Capture the value (buffer pointer), then faithfully replicate the store and return. No tramp needed
+ * (the original is a 3-instruction leaf). pBlock comes from the ROM table via *(0xE0536D58). */
+void edmac_ab0_wrapper(uint32_t port, uint32_t value);
+void edmac_ab0_wrapper(uint32_t port, uint32_t value)
+{
+    edmac_hk_actotal++;
+    if (edmac_hk_on && port < EDMAC_HOOK_NPORTS)
+    {
+        edmac_hk_achits[port]++;
+        if (value) edmac_hk_acval[port] = value;
+    }
+    /* replicate FUN_e0536ab0 exactly: *(DmacInfo[port].pBlock + 0xac) = value */
+    uint32_t base   = *(volatile uint32_t *)0xE0536D58;       /* DmacInfo base = 0xE0DD5C64 */
+    uint32_t pblock = *(volatile uint32_t *)(base + port * 8);
+    *(volatile uint32_t *)(pblock + 0xac) = value;
+}
+
 static void edmac_scan_task(void)
 {
     gui_stop_menu();
     msleep(500);
     for (int i = 0; i < EDMAC_HOOK_NPORTS; i++)
-        { edmac_hk_addr[i] = 0; edmac_hk_b14[i] = 0; edmac_hk_info[i] = 0; edmac_hk_hits[i] = 0; }
+    {
+        edmac_hk_addr[i] = 0; edmac_hk_b14[i] = 0; edmac_hk_info[i] = 0; edmac_hk_hits[i] = 0;
+        edmac_hk_acval[i] = 0; edmac_hk_achits[i] = 0;
+    }
     edmac_hk_on = 0;
     edmac_hk_total = 0;
+    edmac_hk_actotal = 0;
 
-    /* install the runtime detour on SetEDmac @0xE0536ABC (orig 8 bytes:
-     * 2d e9 f0 4f = push {r4-r11,lr}; 05 46 = mov r5,r0; a5 48 = ldr r0,[0xe0536d58]) */
-    static struct function_hook_patch fhp;
-    static struct patch p;
-    static uint8_t hookmem[8];
-    fhp.patch_addr = 0xE0536ABC;
-    fhp.orig_content[0] = 0x2d; fhp.orig_content[1] = 0xe9; fhp.orig_content[2] = 0xf0; fhp.orig_content[3] = 0x4f;
-    fhp.orig_content[4] = 0x05; fhp.orig_content[5] = 0x46; fhp.orig_content[6] = 0xa5; fhp.orig_content[7] = 0x48;
-    fhp.target_function_addr = (uint32_t)&setedmac_wrapper;
-    fhp.description = "SetEDmac cap";
-    if (convert_f_patch_to_patch(&fhp, &p, hookmem))
+    /* install TWO runtime detours (both in the same 64KB page 0xE0530000, so one remap page covers them):
+     *  [0] SetEDmac      @0xE0536ABC: 2d e9 f0 4f (push); 05 46 (mov r5,r0); a5 48 (ldr r0,[0xe0536d58])
+     *  [1] FUN_e0536ab0  @0xE0536AB0: a9 4a; 52 f8 30 00; c0 f8 (-> writes the buffer ptr to pBlock+0xac) */
+    static struct function_hook_patch fhp[2];
+    static struct patch p[2];
+    static uint8_t hookmem[2][8];
+    fhp[0].patch_addr = 0xE0536ABC;
+    fhp[0].orig_content[0] = 0x2d; fhp[0].orig_content[1] = 0xe9; fhp[0].orig_content[2] = 0xf0; fhp[0].orig_content[3] = 0x4f;
+    fhp[0].orig_content[4] = 0x05; fhp[0].orig_content[5] = 0x46; fhp[0].orig_content[6] = 0xa5; fhp[0].orig_content[7] = 0x48;
+    fhp[0].target_function_addr = (uint32_t)&setedmac_wrapper;
+    fhp[0].description = "SetEDmac cap";
+    fhp[1].patch_addr = 0xE0536AB0;
+    fhp[1].orig_content[0] = 0xa9; fhp[1].orig_content[1] = 0x4a; fhp[1].orig_content[2] = 0x52; fhp[1].orig_content[3] = 0xf8;
+    fhp[1].orig_content[4] = 0x30; fhp[1].orig_content[5] = 0x00; fhp[1].orig_content[6] = 0xc0; fhp[1].orig_content[7] = 0xf8;
+    fhp[1].target_function_addr = (uint32_t)&edmac_ab0_wrapper;
+    fhp[1].description = "EDmacAddr cap";
+    if (convert_f_patch_to_patch(&fhp[0], &p[0], hookmem[0]) ||
+        convert_f_patch_to_patch(&fhp[1], &p[1], hookmem[1]))
     {
         NotifyBox(6000, "EDMAC: convert_f_patch failed (no detour)");
         return;
     }
-    int err = apply_patches(&p, 1);
+    int err = apply_patches(p, 2);
     if (err)
     {
         NotifyBox(6000, "EDMAC: apply_patches err=0x%x (no detour, safe)", (unsigned)err);
         return;
     }
-    /* read back the patched entry: if the patch took, this is the hook (ldr.w pc,[pc] = 0xf000f8df) */
-    uint32_t patched = *(volatile uint32_t *)0xE0536ABC;
+    /* read back patched entries: each should be the hook (ldr.w pc,[pc] = 0xf000f8df) */
+    uint32_t patched0 = *(volatile uint32_t *)0xE0536ABC;
+    uint32_t patched1 = *(volatile uint32_t *)0xE0536AB0;
 
-    /* SetEDmac fires when the LV pipeline is (re)configured, not every frame -- so prompt the user to
-     * force a reconfigure (zoom) during a long window. */
+    /* SetEDmac/+0xac fire when the LV pipeline is (re)configured, not every frame -- prompt a zoom. */
     edmac_hk_on = 1;
     NotifyBox(11000, "CAPTURING 12s: ZOOM LiveView in then out NOW (or toggle photo/video)");
     msleep(12000);
     edmac_hk_on = 0;
     msleep(50);
     unpatch_memory(0xE0536ABC);
+    unpatch_memory(0xE0536AB0);
 
     static char b[8000]; int n = 0;
     /* ML snprintf supports %d/%x/%08x but NOT %u or width/flag forms like %-2d -- use only %d/%x. */
     n += snprintf(b + n, sizeof(b) - n,
-        "SetEDmac detour: total_calls=%d  patched_entry=%08x (hook ok if f000f8df)\n"
-        "Port address(last non-zero) b14 info* hits. A WRITE Port 0..38 w/ a big RAM addr = raw.\n",
-        (int)edmac_hk_total, (unsigned)patched);
+        "SetEDmac total=%d (entry %08x)  ABaddr(+0xac) total=%d (entry %08x)  [hook ok if f000f8df]\n"
+        "buf = last non-zero value written to pBlock+0xac. A WRITE Port 0..38 w/ a big RAM buf = raw.\n",
+        (int)edmac_hk_total, (unsigned)patched0, (int)edmac_hk_actotal, (unsigned)patched1);
     int seen = 0;
-    for (int pp = 0; pp < EDMAC_HOOK_NPORTS && n < (int)sizeof(b) - 80; pp++)
+    for (int pp = 0; pp < EDMAC_HOOK_NPORTS && n < (int)sizeof(b) - 100; pp++)
     {
-        if (!edmac_hk_hits[pp]) continue;
+        if (!edmac_hk_hits[pp] && !edmac_hk_achits[pp]) continue;
         seen++;
-        n += snprintf(b + n, sizeof(b) - n, "P%d a=%08x b14=%08x info=%08x hits=%d\n",
-            pp, (unsigned)edmac_hk_addr[pp], (unsigned)edmac_hk_b14[pp],
-            (unsigned)edmac_hk_info[pp], (int)edmac_hk_hits[pp]);
+        n += snprintf(b + n, sizeof(b) - n,
+            "P%d buf=%08x a4val=%08x b14=%08x info=%08x seth=%d ach=%d\n",
+            pp, (unsigned)edmac_hk_acval[pp], (unsigned)edmac_hk_addr[pp],
+            (unsigned)edmac_hk_b14[pp], (unsigned)edmac_hk_info[pp],
+            (int)edmac_hk_hits[pp], (int)edmac_hk_achits[pp]);
     }
     n += snprintf(b + n, sizeof(b) - n, "ports-seen=%d\n", seen);
     FILE * f = FIO_CreateFile("ML/LOGS/EDMAC.TXT");
     if (f) { FIO_WriteFile(f, b, n); FIO_CloseFile(f); }
-    NotifyBox(6000, "SetEDmac detour: total=%u ports=%d -> EDMAC.TXT", (unsigned)edmac_hk_total, seen);
+    NotifyBox(6000, "EDMAC detour: set=%d ac=%d ports=%d -> EDMAC.TXT",
+              (int)edmac_hk_total, (int)edmac_hk_actotal, seen);
 }
 #endif
 
