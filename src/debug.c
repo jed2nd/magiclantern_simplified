@@ -1633,10 +1633,38 @@ static void rawhk_task(void)
     rawhk_on = 1;
     NotifyBox(13000, "RAW HOOK ARMED -- press REC and RECORD now (12s)!");
     beep();
-    msleep(12000);
+    msleep(7000);   /* let every channel populate + recording stabilise */
+    /* SNAPSHOT while recording (buffers fresh): the hook captured each channel's buffer addr via the
+     * function ARG (r1) -- those are RAM addresses, readable even for the faulting-region channels whose
+     * REGISTERS we can't read. Copy 128KB of each logged channel's buffer into one RAM blob (header per
+     * chunk), to render on the PC and find the 14-bit raw. */
+    void * blob = fio_malloc(0x400000u);   /* 4MB */
+    uint32_t bn = 0;
+    if (blob)
+    {
+        for (int c = 0; c < RAWHK_NCH && bn + 0x20000u + 16u <= 0x400000u; c++)
+        {
+            if (!rawhk_hits[c]) continue;
+            uint32_t a0 = rawhk_addr[c];
+            uint32_t cp = a0 & ~0x40000000u;
+            if (cp < 0x01000000u || cp >= 0x60000000u) continue;
+            uint32_t * hdr = (uint32_t *)((uint8_t *)blob + bn);
+            hdr[0] = 0x52415748u; hdr[1] = (uint32_t)c; hdr[2] = a0; hdr[3] = 0x20000u;   /* magic,idx,a0,len */
+            bn += 16;
+            memcpy((uint8_t *)blob + bn, (void *)UNCACHEABLE(cp), 0x20000u);
+            bn += 0x20000u;
+        }
+    }
+    msleep(2000);
     rawhk_on = 0;
     msleep(50);
     unpatch_memory(0xE05364B6);
+    if (blob)
+    {
+        FILE * bf = FIO_CreateFile("ML/LOGS/RAWHKB.BIN");
+        if (bf) { for (uint32_t o = 0; o < bn; o += 0x10000u) { uint32_t cs = bn - o < 0x10000u ? bn - o : 0x10000u; FIO_WriteFile(bf, (uint8_t *)blob + o, cs); } FIO_CloseFile(bf); }
+        fio_free(blob);
+    }
 
     static char b[3600]; int n = 0;
     /* ML snprintf supports %d/%x/%08x only. */
