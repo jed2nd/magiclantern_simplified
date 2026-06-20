@@ -421,3 +421,23 @@ render the dumps (render_full/render_dpraw) -> if Canon's recording raw is full-
 straight (then continuous capture from that channel). If still only previews: the full-res raw truly never
 hits a CPU buffer (recording or LV) on this body -> document as the hard limit; the only remaining path is a
 properly Canon-initialized channel/raw-LV-mode, which is a deep bring-up.
+
+## 16. CONFIRMED HARD LIMIT: full-res raw is NOT CPU-readable in LV *or* recording
+"Rec dump" during H264 recording: the hook caught essentially the SAME channels as plain LV (previews +
+stats), with NEARLY IDENTICAL rowdiff per channel (idx30 19.6 vs 19.5, idx2 45.1 vs 44.4, ...). idx30@640
+renders the SAME clean DEBAYERED kitchen. And **`dpraw: *243ec=00000000`** -> the DprawHeadToRaw config
+pointer is NULL, so the Dual-Pixel-RAW record path is DORMANT in plain H264 (it needs DPRAW mode, a stills
+feature). So the full-res Bayer raw does NOT land in any CPU-readable buffer, in LiveView OR during
+recording -- only debayered previews + stats do.
+
+### Where the EOS R raw bring-up stands (the map is complete; the goal is blocked)
+ACHIEVED: validated runtime ROM-hook infra (MMU 2-page bump + function hooks); full EDMAC API
+(SetEDmac/Connect/Start/CBR-register 0xE0535A82/IRQ-table 0xE0DD641C); Canon raw-LV enable (lv_set_mm+
+lv_save_raw); read+render Canon's live image (the kitchen). BOUNDARIES PROVEN: (1) full-res raw not
+CPU-buffered (LV+rec); (2) commandeer-free-channel slurp UNWORKABLE (StartEDmac -> Err70 bare / hard hang
++CBR -- free chans lack Canon's transfer/ISR infra); (3) EVF state hook crashes EvfCap.
+REMAINING PATHS (all deep/uncertain): (A) TRIGGER the dormant Dpraw path (DprawSap_Start FUN_e071f574 /
+make *243ec non-null) so Canon programs the full-res raw buffer we CAN read -- the most promising; needs
+camera-free RE of the trigger first. (B) fully initialize a free channel the way Canon does (transfer/ISR/
+Boomer/IRQ) -- very deep. (C) a true raw-LV bring-up. Recommendation: pursue (A) via camera-free RE before
+any more camera tests.
