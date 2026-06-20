@@ -1564,191 +1564,97 @@ static void brightness_probe_task(void)
     NotifyBox(3000, "LiveView luma probe done -> BRIGHT.TXT");
 }
 
-/* ---- EDMAC raw-channel capture via a RUNTIME SetEDmac detour (Debug -> "EDMAC raw scan").
- * Why a detour: the blind-MMIO scan CRASHED the R (inactive 0xD04xxxxx channel blocks hard-fault on
- * read), and patch_hook_function isn't compiled for CONFIG_MMU_REMAP. So we use the runtime detour
- * primitive that IS linked on the R: convert_f_patch_to_patch() + apply_patches() install an entry
- * hook on SetEDmac @0xE0536ABC that jumps to setedmac_wrapper. The wrapper RECORDS the args
- * (Port=r0, address=r1, b14=r2, info*=r3) -- no MMIO is touched -- then calls setedmac_tramp, which
- * replays SetEDmac's overwritten prologue and continues the real body at +8. Installed on-demand
- * from the menu (NOT at boot, so a battery pull recovers), captured ~1.5s in LiveView, then
- * unpatched. Raw write channel = a WRITE Port (0..38) whose captured address is a big RAM buffer
- * (~0x4xxxxxxx). info* lets us read geometry later. -> ML/LOGS/EDMAC.TXT */
-#define EDMAC_HOOK_NPORTS 80
-static volatile uint32_t edmac_hk_addr[EDMAC_HOOK_NPORTS];
-static volatile uint32_t edmac_hk_b14 [EDMAC_HOOK_NPORTS];
-static volatile uint32_t edmac_hk_info[EDMAC_HOOK_NPORTS];
-static volatile uint32_t edmac_hk_hits[EDMAC_HOOK_NPORTS];
-static volatile int edmac_hk_on;
-static volatile uint32_t edmac_hk_total;   /* every wrapper call while patched -- proves the hook is live */
-/* FUN_e0536ab0(port,value) -> pBlock+0xac. Turned out +0xa4 AND +0xac are both small (a per-frame
- * index, not the buffer). But this fn fires every frame for an ACTIVE channel, so from its hook we can
- * safely SCAN the live channel's register block (0x40..0xFC) for a value that looks like a RAM buffer
- * (~0x10000000..0x7fffffff) -- that offset is the real ram_addr. Also grab geometry regs 0x48/0x54. */
-static volatile uint32_t edmac_hk_acval[EDMAC_HOOK_NPORTS];   /* +0xac value (small index) */
-static volatile uint32_t edmac_hk_achits[EDMAC_HOOK_NPORTS];
-static volatile uint32_t edmac_hk_actotal;
-static volatile uint8_t  edmac_hk_scanned[EDMAC_HOOK_NPORTS];
-/* full register dump of the (settled) live channel block; stride is 0x100 -> 64 words 0x00..0xFC */
-static volatile uint32_t edmac_hk_dump[EDMAC_HOOK_NPORTS][64];
+/* ---- RAW BUFFER HOOK, Phase 1 diagnostic (Debug -> "Arm raw hook").
+ * The 14-bit raw channel's register block (0xD0487xxx) hard-faults on direct CPU read, so we cannot
+ * read its +0xa0 buffer pointer. Instead we runtime-hook FUN_e05364b6 @0xE05364B6 -- the per-frame leaf
+ * that sets EVERY channel's buffer pointer: *(DmacInfo[chan].pBlock + 0xa0) = addr. The hook
+ * (rawhk_wrapper) logs which channels get a buffer + the addr, then does the original write. SAFE: only
+ * the readable DmacInfo TABLE is read; the +0xa0 store is the exact write Canon does here, in Canon's
+ * powered context (no faulting read). Installed on-demand via convert_f_patch_to_patch()+apply_patches()
+ * (NOT at boot, so a card pull recovers); needs the MMU 2-page bump (page 0xE0530000). Arm, RECORD 12s,
+ * auto-unpatch + dump. Phase 1 confirms the raw channel index; Phase 2 will redirect it to ML's buffer.
+ * -> ML/LOGS/RAWHK.TXT */
+#define RAWHK_NCH 80
+static volatile uint32_t rawhk_addr[RAWHK_NCH];   /* last non-zero +0xa0 buffer addr per channel */
+static volatile uint32_t rawhk_hits[RAWHK_NCH];   /* call count per channel */
+static volatile uint32_t rawhk_total;             /* all calls while patched -- proves the hook is live */
+static volatile int      rawhk_on;
 
-/* Naked trampoline: replays SetEDmac's first 8 bytes -- push {r4-r11,lr}; mov r5,r0;
- * ldr r0,[0xe0536d58] -- relocating the pc-relative ldr to an absolute load, then jumps to
- * SetEDmac+8 (0xE0536AC4 | thumb). r1/r2/r3 (addr/b14/info) are left untouched, exactly as the
- * real body at +8 expects. Stack stays balanced: this push is popped by SetEDmac's own epilogue,
- * returning into setedmac_wrapper. */
-extern void setedmac_tramp(uint32_t port, uint32_t addr, uint32_t b14, void *info);
-__attribute__((naked)) void setedmac_tramp(uint32_t port, uint32_t addr, uint32_t b14, void *info)
+/* Replaces FUN_e05364b6 (a one-line leaf): *(DmacInfo[chan].pBlock + 0xa0) = addr.  r0=chan, r1=addr.
+ * Log which channels get a buffer set + the addr (to find the RAW channel), then do the original write.
+ * SAFE: reads only the readable DmacInfo TABLE (*(0xE0536D58)=0xE0DD5C64); the ONLY channel-register
+ * touch is the +0xa0 WRITE -- the exact store Canon itself does here, in Canon's own powered context
+ * (no faulting CPU read of 0xD0487xxx). The write always happens (preserves the original behaviour);
+ * only the logging is gated on rawhk_on. */
+void rawhk_wrapper(uint32_t chan, uint32_t addr);
+void rawhk_wrapper(uint32_t chan, uint32_t addr)
 {
-    asm volatile (
-        "push {r4, r5, r6, r7, r8, r9, r10, r11, lr}\n" /* = 0xE0536ABC */
-        "mov  r5, r0\n"                                  /* = 0xE0536AC0 */
-        "movw r0, #0x6d58\n"                             /* relocate ldr r0,[0xe0536d58]: */
-        "movt r0, #0xe053\n"
-        "ldr  r0, [r0]\n"                                /*   r0 = *(0xe0536d58) */
-        "movw r12, #0x6ac5\n"                            /* SetEDmac+8 | thumb bit */
-        "movt r12, #0xe053\n"
-        "bx   r12\n"
-    );
-}
-
-/* Detour target: replaces SetEDmac's entry. Record args (no MMIO), then run the real fn via tramp. */
-void setedmac_wrapper(uint32_t port, uint32_t addr, uint32_t b14, void *info);
-void setedmac_wrapper(uint32_t port, uint32_t addr, uint32_t b14, void *info)
-{
-    edmac_hk_total++;   /* unconditional: proves SetEDmac is actually flowing through us */
-    if (edmac_hk_on && port < EDMAC_HOOK_NPORTS)
-    {
-        edmac_hk_hits[port]++;
-        /* keep the last NON-ZERO buffer setup; addr==0 is a channel teardown/clear (e.g. zoom-out)
-         * and must not overwrite the real buffer we're hunting. */
-        if (addr)
-        {
-            edmac_hk_addr[port] = addr;
-            edmac_hk_b14 [port] = b14;
-            edmac_hk_info[port] = (uint32_t)info;
-        }
-    }
-    setedmac_tramp(port, addr, b14, info);
-}
-
-/* Detour target for FUN_e0536ab0 @0xE0536AB0 -- a leaf that does *(DmacInfo[port].pBlock+0xac)=value.
- * Capture the value (buffer pointer), then faithfully replicate the store and return. No tramp needed
- * (the original is a 3-instruction leaf). pBlock comes from the ROM table via *(0xE0536D58). */
-void edmac_ab0_wrapper(uint32_t port, uint32_t value);
-void edmac_ab0_wrapper(uint32_t port, uint32_t value)
-{
-    edmac_hk_actotal++;
+    rawhk_total++;
     uint32_t base   = *(volatile uint32_t *)0xE0536D58;       /* DmacInfo base = 0xE0DD5C64 */
-    uint32_t pblock = *(volatile uint32_t *)(base + port * 8);
-    if (edmac_hk_on && port < EDMAC_HOOK_NPORTS)
+    uint32_t pblock = *(volatile uint32_t *)(base + chan * 8);
+    if (rawhk_on && chan < RAWHK_NCH)
     {
-        edmac_hk_achits[port]++;
-        if (value) edmac_hk_acval[port] = value;
-        /* dump the whole channel block once it's SETTLED (8th update -- not the 1st, which is often
-         * before SetEDmac has configured it). Read the full 0x00..0xFC (stride is 0x100). */
-        if (!edmac_hk_scanned[port] && edmac_hk_achits[port] == 4)
-        {
-            edmac_hk_scanned[port] = 1;
-            for (int w = 0; w < 64; w++)
-                edmac_hk_dump[port][w] = *(volatile uint32_t *)(pblock + w * 4);
-        }
+        rawhk_hits[chan]++;
+        if (addr) rawhk_addr[chan] = addr;                    /* keep last non-zero (teardown writes 0) */
     }
-    /* replicate FUN_e0536ab0 exactly: *(DmacInfo[port].pBlock + 0xac) = value */
-    *(volatile uint32_t *)(pblock + 0xac) = value;
+    *(volatile uint32_t *)(pblock + 0xa0) = addr;             /* replicate FUN_e05364b6 */
 }
 
-static void edmac_scan_task(void)
+static void rawhk_task(void)
 {
     gui_stop_menu();
     msleep(500);
-    for (int i = 0; i < EDMAC_HOOK_NPORTS; i++)
-    {
-        edmac_hk_addr[i] = 0; edmac_hk_b14[i] = 0; edmac_hk_info[i] = 0; edmac_hk_hits[i] = 0;
-        edmac_hk_acval[i] = 0; edmac_hk_achits[i] = 0; edmac_hk_scanned[i] = 0;
-        for (int w = 0; w < 64; w++) edmac_hk_dump[i][w] = 0;
-    }
-    edmac_hk_on = 0;
-    edmac_hk_total = 0;
-    edmac_hk_actotal = 0;
+    for (int i = 0; i < RAWHK_NCH; i++) { rawhk_addr[i] = 0; rawhk_hits[i] = 0; }
+    rawhk_on = 0; rawhk_total = 0;
 
-    /* install TWO runtime detours (both in the same 64KB page 0xE0530000, so one remap page covers them):
-     *  [0] SetEDmac      @0xE0536ABC: 2d e9 f0 4f (push); 05 46 (mov r5,r0); a5 48 (ldr r0,[0xe0536d58])
-     *  [1] FUN_e0536ab0  @0xE0536AB0: a9 4a; 52 f8 30 00; c0 f8 (-> writes the buffer ptr to pBlock+0xac) */
-    static struct function_hook_patch fhp[2];
-    static struct patch p[2];
-    static uint8_t hookmem[2][8];
-    fhp[0].patch_addr = 0xE0536ABC;
-    fhp[0].orig_content[0] = 0x2d; fhp[0].orig_content[1] = 0xe9; fhp[0].orig_content[2] = 0xf0; fhp[0].orig_content[3] = 0x4f;
-    fhp[0].orig_content[4] = 0x05; fhp[0].orig_content[5] = 0x46; fhp[0].orig_content[6] = 0xa5; fhp[0].orig_content[7] = 0x48;
-    fhp[0].target_function_addr = (uint32_t)&setedmac_wrapper;
-    fhp[0].description = "SetEDmac cap";
-    fhp[1].patch_addr = 0xE0536AB0;
-    fhp[1].orig_content[0] = 0xa9; fhp[1].orig_content[1] = 0x4a; fhp[1].orig_content[2] = 0x52; fhp[1].orig_content[3] = 0xf8;
-    fhp[1].orig_content[4] = 0x30; fhp[1].orig_content[5] = 0x00; fhp[1].orig_content[6] = 0xc0; fhp[1].orig_content[7] = 0xf8;
-    fhp[1].target_function_addr = (uint32_t)&edmac_ab0_wrapper;
-    fhp[1].description = "EDmacAddr cap";
-    if (convert_f_patch_to_patch(&fhp[0], &p[0], hookmem[0]) ||
-        convert_f_patch_to_patch(&fhp[1], &p[1], hookmem[1]))
+    /* runtime-hook FUN_e05364b6 @0xE05364B6 (page 0xE0530000 -- needs the MMU 2-page bump).
+     * orig 8 bytes: 88 4a (ldr r2,[pc,..]); 52 f8 30 00 (ldr.w); c0 f8 (str.w r1,[r0,#0xa0]). */
+    static struct function_hook_patch fhp;
+    static struct patch p;
+    static uint8_t hookmem[8];
+    fhp.patch_addr = 0xE05364B6;
+    static const uint8_t oc[8] = {0x88, 0x4a, 0x52, 0xf8, 0x30, 0x00, 0xc0, 0xf8};
+    for (int i = 0; i < 8; i++) fhp.orig_content[i] = oc[i];
+    fhp.target_function_addr = (uint32_t)&rawhk_wrapper;
+    fhp.description = "raw +a0 cap";
+    if (convert_f_patch_to_patch(&fhp, &p, hookmem))
     {
-        NotifyBox(6000, "EDMAC: convert_f_patch failed (no detour)");
+        NotifyBox(6000, "raw hook: convert_f_patch failed (no hook)");
         return;
     }
-    int err = apply_patches(p, 2);
+    int err = apply_patches(&p, 1);
     if (err)
     {
-        NotifyBox(6000, "EDMAC: apply_patches err=0x%x (no detour, safe)", (unsigned)err);
+        NotifyBox(8000, "raw hook: apply_patches err=0x%x (no hook, safe)", (unsigned)err);
         return;
     }
-    /* read back patched entries: each should be the hook (ldr.w pc,[pc] = 0xf000f8df) */
-    uint32_t patched0 = *(volatile uint32_t *)0xE0536ABC;
-    uint32_t patched1 = *(volatile uint32_t *)0xE0536AB0;
+    uint32_t patched = *(volatile uint32_t *)0xE05364B6;   /* should read back f000f8df (ldr.w pc,[pc]) */
 
-    /* SetEDmac/+0xac fire when the LV pipeline is (re)configured, not every frame -- prompt a zoom. */
-    edmac_hk_on = 1;
-    NotifyBox(11000, "CAPTURING 12s: ZOOM LiveView in then out NOW (or toggle photo/video)");
+    rawhk_on = 1;
+    NotifyBox(13000, "RAW HOOK ARMED -- press REC and RECORD now (12s)!");
+    beep();
     msleep(12000);
-    edmac_hk_on = 0;
+    rawhk_on = 0;
     msleep(50);
-    unpatch_memory(0xE0536ABC);
-    unpatch_memory(0xE0536AB0);
+    unpatch_memory(0xE05364B6);
 
-    static char b[14000]; int n = 0;
-    /* ML snprintf supports %d/%x/%08x but NOT %u or width/flag forms like %-2d -- use only %d/%x. */
+    static char b[3600]; int n = 0;
+    /* ML snprintf supports %d/%x/%08x only. */
     n += snprintf(b + n, sizeof(b) - n,
-        "SetEDmac total=%d  +0xac total=%d  (entries %08x/%08x, hook ok if f000f8df)\n"
-        "Full settled-channel reg dump (off:val, non-zero only). Buffer = a clean RAM ptr (not (X<<16)|small).\n",
-        (int)edmac_hk_total, (int)edmac_hk_actotal, (unsigned)patched0, (unsigned)patched1);
-    int seen = 0;
-    for (int pp = 0; pp < EDMAC_HOOK_NPORTS && n < (int)sizeof(b) - 260; pp++)
+        "raw +0xa0 hook: total=%d  entry=%08x (hook ok if f000f8df)\n"
+        "idx pblock hits a0 -- the RAW chan = a big rotating a0 (~0x4xxxxxxx) set every frame.\n",
+        (int)rawhk_total, (unsigned)patched);
+    uint32_t base = *(volatile uint32_t *)0xE0536D58;
+    for (int c = 0; c < RAWHK_NCH && n < (int)sizeof(b) - 80; c++)
     {
-        if (!edmac_hk_achits[pp]) continue;
-        seen++;
-        n += snprintf(b + n, sizeof(b) - n, "P%d ach=%d:", pp, (int)edmac_hk_achits[pp]);
-        for (int w = 0; w < 64 && n < (int)sizeof(b) - 24; w++)
-            if (edmac_hk_dump[pp][w])
-                n += snprintf(b + n, sizeof(b) - n, " %x:%08x", w * 4, (unsigned)edmac_hk_dump[pp][w]);
-        n += snprintf(b + n, sizeof(b) - n, "\n");
-        /* find a buffer pointer (clean word-aligned value in safe RAM range) and peek 8 words of it,
-         * so its content tells us what the channel carries (raw Bayer vs YUV vs stats). */
-        for (int w = 0; w < 64; w++)
-        {
-            uint32_t v = edmac_hk_dump[pp][w];
-            if (v >= 0x01000000 && v < 0x20000000 && (v & 3) == 0)
-            {
-                n += snprintf(b + n, sizeof(b) - n, "  buf@%x=%08x mem:", w * 4, (unsigned)v);
-                for (int k = 0; k < 8 && n < (int)sizeof(b) - 12; k++)
-                    n += snprintf(b + n, sizeof(b) - n, " %08x", (unsigned)*(volatile uint32_t *)(v + k * 4));
-                n += snprintf(b + n, sizeof(b) - n, "\n");
-                break;
-            }
-        }
+        if (!rawhk_hits[c]) continue;
+        uint32_t pblock = *(volatile uint32_t *)(base + c * 8);
+        n += snprintf(b + n, sizeof(b) - n, "idx%d %08x hits=%d a0=%08x\n",
+                      c, (unsigned)pblock, (int)rawhk_hits[c], (unsigned)rawhk_addr[c]);
     }
-    n += snprintf(b + n, sizeof(b) - n, "ports-seen=%d\n", seen);
-    FILE * f = FIO_CreateFile("ML/LOGS/EDMAC.TXT");
+    FILE * f = FIO_CreateFile("ML/LOGS/RAWHK.TXT");
     if (f) { FIO_WriteFile(f, b, n); FIO_CloseFile(f); }
-    NotifyBox(6000, "EDMAC detour: set=%d ac=%d ports=%d -> EDMAC.TXT",
-              (int)edmac_hk_total, (int)edmac_hk_actotal, seen);
+    NotifyBox(9000, "raw hook: %d calls -> RAWHK.TXT", (int)rawhk_total);
 }
 
 /* ---- RAW BRIGHTNESS + SCREEN-SLEEP TEST (Debug -> "Raw bright test").
@@ -2001,7 +1907,7 @@ static void raw_recwin_task(void)
     static void *   cap[16];
     static uint32_t capsz[16];
     for (int i = 0; i < 16; i++) { prevchk[i] = 0; cap[i] = 0; capsz[i] = 0; }
-    static char lg[6500]; int n = 0;
+    static char lg[1024]; int n = 0;   /* shrunk to free BSS for the MMU 2-page bump (raw hook) */
     int total_cap = 0;
     n += snprintf(lg + n, sizeof(lg) - n, "REC-WINDOW sampler: SAFE wide chans sampled while recording.\n");
     NotifyBox(8000, "REC WINDOW: START RECORDING now -- sampling 25s");
@@ -2369,11 +2275,11 @@ static struct menu_entry debug_menus[] = {
         .help2 = "Finds a metering signal for adaptive-exposure timelapse. -> BRIGHT.TXT.",
     },
     {
-        .name        = "EDMAC raw scan",
-        .priv        = edmac_scan_task,
+        .name        = "Arm raw hook",
+        .priv        = rawhk_task,
         .select      = run_in_separate_task,
-        .help  = "IN LIVEVIEW: runtime SetEDmac detour ~1.5s to find the raw write channel.",
-        .help2 = "Toward CONFIG_RAW. Arg-capture, auto-unpatch (no MMIO poke). -> ML/LOGS/EDMAC.TXT.",
+        .help  = "Select, then press REC + RECORD 12s: hooks FUN_e05364b6 (the +0xa0 buffer setter).",
+        .help2 = "Logs which chan gets the raw buffer (idx+a0). Auto-unpatch. -> ML/LOGS/RAWHK.TXT.",
     },
     {
         .name        = "Raw bright test",

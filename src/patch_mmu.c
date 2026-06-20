@@ -37,12 +37,12 @@
  * calc_mmu_globals already aligns the L1 table / 64KB page WITHIN this buffer (via start_adjust),
  * so the buffer itself needs NO 0x10000 alignment -- just MMU_PAGE_SIZE of slack for that internal
  * alignment. Dropping the attribute removes the padding while keeping the remap functional. */
-/* 2026-06-19 R: reverted to ONE remapped 64KB page. The 2-page bump (for the runtime SetEDmac detour
- * that FOUND the raw channel, P14/0xD0440000) cost +66KB BSS and pushed _bss_end past the R's user_mem
- * budget -> solid-red-LED no-boot. The detour's job is done (raw channel known), and nothing else needs
- * a runtime ROM patch, so revert to the known-good 1-page size. Re-add 2*..(see git fdc0ff7) only if a
- * future build needs to runtime-patch a new 1MB region again. */
-static uint8_t generic_mmu_space[MMU_PAGE_SIZE + MMU_L1_TABLE_SIZE
+/* 2026-06-20 R: TWO remapped 64KB pages. ML boot uses one (the 0xE03C0000 normal_code_patch); the
+ * second is for the runtime raw-buffer hook on FUN_e05364b6 @0xE05364B6 (page 0xE0530000), installed
+ * via apply_patches when armed from the menu. num_64k_pages auto-derives from this buffer size
+ * (aligned_space / MMU_PAGE_SIZE). The +64KB BSS is offset by removing the dead detour/sampler code so
+ * _bss_end stays < 0x144800 (red-LED guard). 1-page form (see git history) only fits ONE remap. */
+static uint8_t generic_mmu_space[2 * MMU_PAGE_SIZE + MMU_L1_TABLE_SIZE
                                  + 0x300 + MMU_L2_TABLE_SIZE
                                  + sizeof(struct mmu_L2_page_info)
                                  + MMU_PAGE_SIZE /* slack for internal 64KB alignment */];
