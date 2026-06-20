@@ -1843,12 +1843,18 @@ static void cbrslurp_task(void)
     beep();
     msleep(2000);
 
-    /* mlv_lite order: register completion CBR (heartbeat) -> connect -> buffer+geometry -> start */
-    r_regcomplete(chan, (void *)slurp_complete_cbr, 0);
-    r_connw(chan, conn);
-    r_setbuf(chan, ubuf);
-    r_setedmac(chan, 0, 0, ei);
-    r_start(chan);
+    /* STAGED: marker to SLURPS.TXT (truncating, flushed) + NotifyBox before each op, so a crash/reboot
+     * still tells us the culprit step. mlv_lite order: regcomplete -> connect -> buffer+geom -> start. */
+#define CS_MARK(s) do { FILE * sf = FIO_CreateFile("ML/LOGS/SLURPS.TXT"); \
+        if (sf) { const char * mm = "last step reached: " s "\n"; FIO_WriteFile(sf, mm, strlen(mm)); FIO_CloseFile(sf); } \
+        NotifyBox(2500, "cbrslurp: " s); beep(); msleep(1500); } while (0)
+    CS_MARK("regcomplete"); r_regcomplete(chan, (void *)slurp_complete_cbr, 0);
+    CS_MARK("connw");       r_connw(chan, conn);
+    CS_MARK("setbuf");      r_setbuf(chan, ubuf);
+    CS_MARK("setedmac");    r_setedmac(chan, 0, 0, ei);
+    CS_MARK("start");       r_start(chan);
+    CS_MARK("waiting");
+#undef CS_MARK
 
     int waited = 0;
     while (!ss_cbr_done && waited < 2000) { msleep(20); waited += 20; }   /* wait a frame completion (NOT EVF vsync) */

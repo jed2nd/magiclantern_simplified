@@ -369,3 +369,19 @@ copy ubuf -> ML/LOGS/SLURP.BIN + SLURPS.TXT (logs cbr count + regs). Geometry 19
 (Dpraw may need 2x width). RISK: still commandeers idx7+conn0 -> if the CBR-heartbeat theory is wrong it may
 Err70/reboot (recoverable, menu-invoked). NEXT: user runs it; SLURPS.TXT cbr>0 + a coherent Bayer SLURP.BIN
 = RAW SLURPED (milestone). If Err70: add Abort/Pop CBRs / rethink. If blank/garbage: iterate geometry/conn.
+
+## 14. CBR slurp crashed+rebooted (no Err70). IRQ table found; staged to pinpoint.
+"CBR slurp" -> crash + reboot, NO Err70 (a kernel panic, not a recording error). Diagnosis:
+- `FUN_e0554504` (called by RegisterEDmacCompleteCBR) = **RegisterInterruptHandler** (SystemIF::KerInt.c):
+  asserts the IRQ id is in [1,0x1ff]; on bad id -> panic.
+- **EDMAC completion IRQ-ID table @ `0xE0DD641C`** (ROM, {irq_id, handler} per chan, stride 8). EVERY
+  channel has a VALID id incl **idx7 (irq=0xd1, handler=0xe05378d7** = Canon's generic EDMAC completion ISR,
+  same for all chans). DAT refs: pBlock table DAT_e0535d30=0xE0DD5C64 (DmacInfo); cbr table DAT_e0535d98=
+  0x00073de8 (RAM); irq table DAT_e0535d9c=0xE0DD641C (ROM).
+- => the crash is NOT a missing IRQ id. It's deeper: re-RegisterInterruptHandler on an already-live IRQ
+  (0xd1) and/or the StartEDmac transfer/completion on a commandeered free channel. The free-channel slurp
+  keeps hitting firmware walls: bare -> Err70 at start; +CompleteCBR -> panic.
+Built STAGED CBR slurp (md5 a04584bc @ 15:27): marker to SLURPS.TXT + NotifyBox before each op
+(regcomplete/connw/setbuf/setedmac/start/waiting) -> the last marker = the crash step (survives reboot).
+NEXT: user runs it, reports the last on-screen step (or SLURPS.TXT). That localizes the panic so we fix it
+(skip the redundant re-register; or don't re-enable the IRQ; or the conn0 double-write is fundamental).
