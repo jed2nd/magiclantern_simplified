@@ -32,17 +32,15 @@ const uint32_t prop_handler_deny[] =
     // On the R a runtime PROP_ISO slave delivered fine + the handler now decodes the byte-1 code,
     // so it is allowed (read) and written -- see prop_write_allow[] below.
     //
-    // PROP_MVR_REC_START was denied ("probably ... MVR stubs wrong") but that was precautionary, not a
-    // confirmed crash. Investigation: every PROP_MVR_REC_START handler that COMPILES for the R is benign.
-    //  - lens.c: mvr_rec_start_shoot() is EMPTY here (FEATURE_REC_NOTIFY/REC_PICSTYLE undefined) and
-    //    mvr_create_logfile is behind FEATURE_MOVIE_LOGGING (off).
-    //  - fps-engio.c: only restore_sound_recording(), a no-op while old_sound_recording_mode==-1; even
-    //    if it ran, set_sound_recording -> prop_request_change(PROP_MOVIE_SOUND_RECORD) is write-blocked.
-    //  - beep.c handler is behind FEATURE_WAV_RECORDING (off); audio-common.c is not compiled for R.
-    //  - propvalues.c just does PROP_INT(PROP_MVR_REC_START, __recording) -- a plain store.
-    // Allowing the read registers that store so __recording / RECORDING / RECORDING_H264 work. This is
-    // needed to gate movie-only work -- e.g. the raw EDMAC channel 0xD0487000 only powers up while
-    // recording, so the raw catcher must know when recording is active.
+    // PROP_MVR_REC_START: STILL DENIED. The static handler analysis looked benign (lens.c
+    // mvr_rec_start_shoot empty, fps-engio.c no-op, beep/audio-common not compiled, propvalues.c just
+    // stores __recording), BUT un-denying it CRASHES at ML boot on real hardware (crash loop, 2026-06-20).
+    // The property is delivered to the newly-registered handler during boot and something faults.
+    // IMPORTANT: qemu does NOT catch this -- it reaches "K424 READY" before/without the property
+    // delivery, so qemu_proof.sh falsely passes. So the original "MVR stubs wrong" warning was REAL.
+    // To enable later: find which handler/stub faults on first delivery (PROP_HANDLER runs the body on
+    // the initial value too), guard or fix it, and verify with a LATE qemu milestone or a full boot run.
+    PROP_MVR_REC_START, // crashes at boot when registered -- see note above
     PROP_LV_AFFRAME // so far crash only confirmed on Digic 8
 };
 
