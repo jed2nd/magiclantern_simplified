@@ -1823,6 +1823,91 @@ static void evflog_task(void)
     NotifyBox(9000, "EVFlog: %d xition types -> EVFLOG.TXT (~once/frame = readout)", evflog_n);
 }
 
+/* ---- Frame-synced slurp (Debug -> "Sync slurp").  Err 70 came from StartEDmac mid-frame; this starts the
+ * slurp from the per-frame EVF readout transition (the vsync point, found via "Log EVF xitions") so the
+ * engine accepts it -- mlv_lite's method. Runtime EVF-spy (recoverable, NOT a boot change): on each readout
+ * transition, re-arm the slurp (setbuf/setedmac/connw/start) into our uncached buffer; after ~2s of frames,
+ * restore + copy -> SLURP.BIN (+ SLURPS.TXT regs). *** Set SS_IN/SS_OLD from EVFLOG.TXT before deploy. *** */
+#define SS_IN   5       /* readout transition input     -- UPDATE from EVFLOG.TXT */
+#define SS_OLD  5       /* readout transition old_state -- UPDATE from EVFLOG.TXT */
+#define SS_CHAN 7u      /* free write channel idx7 */
+#define SS_W    1920
+#define SS_H    1080
+static volatile int ss_on = 0;
+static volatile int ss_frames = 0;
+static uint32_t ss_ubuf = 0;
+static uint32_t ss_ei[0x16];
+static void (*ss_setbuf)(uint32_t, uint32_t) = 0;
+static void (*ss_setedmac)(uint32_t, uint32_t, uint32_t, uint32_t *) = 0;
+static void (*ss_connw)(uint32_t, uint32_t) = 0;
+static void (*ss_start)(uint32_t) = 0;
+
+static int FAST ss_spy(struct state_object * self, int x, int input, int z, int t)
+{
+    int old = self->current_state;
+    int ans = evf_orig_st(self, x, input, z, t);
+    if (ss_on && input == SS_IN && old == SS_OLD && ss_frames < 100000)
+    {
+        /* re-arm the slurp at the readout point (Canon's own per-frame EDMAC context) */
+        ss_setbuf(SS_CHAN, ss_ubuf);
+        ss_setedmac(SS_CHAN, 0, 0, ss_ei);
+        ss_connw(SS_CHAN, 0);
+        ss_start(SS_CHAN);
+        ss_frames++;
+    }
+    return ans;
+}
+
+static void syncslurp_task(void)
+{
+    gui_stop_menu();
+    msleep(500);
+    if (!lv) { NotifyBox(5000, "SyncSlurp: enter LiveView first"); return; }
+    struct state_object * evf = EVF_STATE;
+    if (!evf) { NotifyBox(5000, "SyncSlurp: EVF_STATE null"); return; }
+
+    ss_setbuf   = (void *)(0xE05364B6u | 1);
+    ss_setedmac = (void *)(0xE0536ABCu | 1);
+    ss_connw    = (void *)(0xE053607Cu | 1);
+    ss_start    = (void *)(0xE053595Eu | 1);
+
+    uint32_t pitch = SS_W * 14u / 8u;
+    uint32_t sz = pitch * SS_H;
+    void * buf = fio_malloc(sz);
+    if (!buf) { NotifyBox(6000, "SyncSlurp: fio_malloc %d fail", (int)sz); return; }
+    ss_ubuf = (uint32_t)buf | 0x40000000u;
+    memset((void *)ss_ubuf, 0, sz);
+    for (int i = 0; i < 0x16; i++) ss_ei[i] = 0;
+    ss_ei[0x10] = pitch;       /* xb */
+    ss_ei[0x13] = SS_H - 1;    /* yb */
+
+    ss_frames = 0;
+    evf_orig_st = (void *)evf->StateTransition_maybe;
+    evf->StateTransition_maybe = (void *)ss_spy;
+    ss_on = 1;
+    NotifyBox(3000, "SyncSlurp: capturing in=%d old=%d ...", SS_IN, SS_OLD);
+    msleep(2000);              /* ~60-120 readout frames of re-arming */
+    ss_on = 0;
+    evf->StateTransition_maybe = (void *)evf_orig_st;   /* restore Canon's handler */
+    msleep(100);
+
+    uint32_t pblock = *(volatile uint32_t *)(0xE0DD5C64u + SS_CHAN * 8);
+    static char tt[240]; int nn = 0;
+    nn += snprintf(tt + nn, sizeof(tt) - nn, "syncslurp in=%d old=%d frames=%d chan=%d %dx%d pitch=%d\nregs:",
+                   SS_IN, SS_OLD, (int)ss_frames, (int)SS_CHAN, SS_W, SS_H, (int)pitch);
+    for (uint32_t off = 0x48; off <= 0x58; off += 4)
+        nn += snprintf(tt + nn, sizeof(tt) - nn, " %x=%08x", (unsigned)off, (unsigned)*(volatile uint32_t *)(pblock + off));
+    nn += snprintf(tt + nn, sizeof(tt) - nn, " a0=%08x b4=%08x\n",
+                   (unsigned)*(volatile uint32_t *)(pblock + 0xa0u), (unsigned)*(volatile uint32_t *)(pblock + 0xb4u));
+    FILE * tf = FIO_CreateFile("ML/LOGS/SLURPS.TXT");
+    if (tf) { FIO_WriteFile(tf, tt, nn); FIO_CloseFile(tf); }
+
+    FILE * f = FIO_CreateFile("ML/LOGS/SLURP.BIN");
+    if (f) { for (uint32_t o = 0; o < sz; o += 0x10000u) { uint32_t cs = sz - o < 0x10000u ? sz - o : 0x10000u; FIO_WriteFile(f, (uint8_t *)ss_ubuf + o, cs); } FIO_CloseFile(f); }
+    fio_free(buf);
+    NotifyBox(10000, "SyncSlurp: %d frames -> SLURP.BIN (+SLURPS.TXT)", (int)ss_frames);
+}
+
 /* ---- RAW BRIGHTNESS + SCREEN-SLEEP TEST (Debug -> "Raw bright test").
  * We found the LV raw write channel: DmacInfo Port 14 = pBlock 0xD0440000, buffer-pointer reg at
  * +0x50, content = uncompressed Bayer. This averages that buffer over ~80s while logging a checksum,
@@ -2460,6 +2545,13 @@ static struct menu_entry debug_menus[] = {
         .select      = run_in_separate_task,
         .help  = "In LiveView: spies EVF_STATE transitions 4s to find the once/frame readout (vsync) point.",
         .help2 = "For the frame-synced slurp. Runtime install/restore (recoverable). -> ML/LOGS/EVFLOG.TXT.",
+    },
+    {
+        .name        = "Sync slurp",
+        .priv        = syncslurp_task,
+        .select      = run_in_separate_task,
+        .help  = "In LiveView: re-arms the raw slurp at the EVF readout transition (frame-synced, no Err70).",
+        .help2 = "The robust capture. Set SS_IN/SS_OLD from EVFLOG first. -> ML/LOGS/SLURP.BIN (+SLURPS.TXT).",
     },
     {
         .name        = "Raw bright test",

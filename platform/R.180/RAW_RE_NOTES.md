@@ -217,3 +217,14 @@ Menu task: runtime-swaps EVF_STATE(0x77c4)->StateTransition_maybe(+0x0c) for a s
 EVF object identity (type/name/max_inputs/max_states). -> ML/LOGS/EVFLOG.TXT. The transition whose count ~=
 the LV frame count (~120 over 4s @30fps) is the readout-done (vsync) point. NEXT: user runs it in LV; read
 EVFLOG.TXT -> that (input,old_state) is the R's CONFIG_EVF_STATE_SYNC transition for the frame-synced slurp.
+
+### Built (prepped, not yet deployed): "Sync slurp" (syncslurp_task) -- the frame-synced capture
+The robust capture, ready to arm once EVFLOG gives the readout transition. Menu task (LiveView): installs a
+runtime EVF spy (reuses evflog infra, recoverable) that, on the readout transition (SS_IN/SS_OLD --
+PLACEHOLDERS 5/5, set from EVFLOG.TXT), re-arms the slurp every frame: setbuf(idx7,ubuf) + SetEDmac(geom) +
+ConnectWriteEDmac(idx7,0) + StartEDmac(idx7). Starting AT the readout point (not mid-frame) is what should
+dodge Err 70. After ~2s, restores Canon's handler, copies ubuf -> ML/LOGS/SLURP.BIN (+ SLURPS.TXT regs).
+Build verified (_bss_end=0x142d00 < 0x144800). DEPLOY ONLY after setting SS_IN/SS_OLD from EVFLOG. Open
+questions to resolve from the first capture: (a) does conn0 carry Bayer raw in plain LV, or do we need a
+RAW_TYPE_REGISTER write per frame (raw.c:2137) to force raw output; (b) real geometry (1920x1080 is a guess
+-- render will tell). Workflow: user runs "Log EVF xitions" -> I set the transition -> deploy "Sync slurp".
