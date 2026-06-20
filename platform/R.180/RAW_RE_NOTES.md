@@ -228,3 +228,13 @@ Build verified (_bss_end=0x142d00 < 0x144800). DEPLOY ONLY after setting SS_IN/S
 questions to resolve from the first capture: (a) does conn0 carry Bayer raw in plain LV, or do we need a
 RAW_TYPE_REGISTER write per frame (raw.c:2137) to force raw output; (b) real geometry (1920x1080 is a guess
 -- render will tell). Workflow: user runs "Log EVF xitions" -> I set the transition -> deploy "Sync slurp".
+
+### Fallback RE status (RAW_TYPE register + geometry) -- DEFERRED until the first Sync-slurp capture
+RAW_TYPE_REGISTER is only defined in raw.c for DIGIC IV (0xC0F08114) / V (0xC0F37014); the R is DIGIC 8 ->
+not covered. ROM has no "RawType"/"AfRaw"/"SetCcdRaw" strings (D8 names it differently), so finding the R's
+raw-type register would need decompiling the LV raw-config chain (the 5D3 route: decompile lv_af_raw ->
+lv_set_raw_type -> the C0Fxxxxx reg it writes). DEFERRED on purpose: the first "Sync slurp" capture answers
+whether we even need it -- if conn0 already carries 14-bit Bayer in LV, no RAW_TYPE write is needed; if the
+capture is debayered/8-bit, THEN RE lv raw-type. Likewise the real LV raw geometry: the rendered first
+capture reveals the true width (autocorrelation/structure), so 1920x1080 is just a starting guess. Net:
+unblock by capturing first, then tune RAW_TYPE/geometry from the actual data. Waiting on EVFLOG.TXT.
