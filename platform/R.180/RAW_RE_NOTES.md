@@ -270,3 +270,25 @@ make Canon output raw, log/snapshot which channel now gets the raw buffer (10s),
 unpatch. No EVF hook (no EvfCap crash), no channel commandeer (no Err70) -- just enable Canon's own raw +
 read the buffer it programs. -> ML/LOGS/RAWHK.TXT + RAWHKB.BIN. NEXT: user runs it in movie LV; render the
 snapshot -> the channel whose buffer is now Bayer (vs the debayered ones seen without raw mode) = the RAW.
+
+## 10. Raw-LV hook WORKED -- raw mode engaged, 24 channels; full-frame dump next
+"Raw-LV hook" (lv_set_mm+lv_save_raw + the +0xa0 hook in movie LiveView, NO record) ran clean (no crash,
+no Err70) and caught **24 channels** (total=9381) -- a much richer set than the debayered-only run. So the
+Canon raw-LV eventprocs DO engage on the R. Hook entry read back f002f8df (the +2 LDR.W variant -- correct
+for the odd-2 addr). Many channels now have rotating uncached 0x4xxxxxxx / 0x7xxxxxxx DMA buffers.
+
+Analysis of the 128KB top-slivers (eosr_port/render_rawhkb.py, pure-stdlib): row-correlation + stride.
+**14-bit-plausible candidates (stride = width*14/8):**
+- idx2 & idx48: stride 6720 = **3840px @ 14-bit = 4K width** (a0 658a0000, rowcorr 0.63)
+- idx45 & idx4 & idx65: stride 3360 = 1920px @ 14-bit = 1080p (rowcorr 0.51-0.59)
+- idx55: stride 3584 = 2048px @ 14-bit ; idx18: stride 3192 = 1824px @ 14-bit
+High byte-level adjacent/alternate (likely 16-bit interleave): idx5/6/54 (bayer 4-5.5).
+**Inconclusive from slivers**: only the top ~19-39 rows captured (may be optical-black/top), and 14-bit
+byte view shows packing-stripe artifacts. NEED full frames. Built "Raw-LV dump" (rawlv_dump_task, md5
+5e999e78 @ 13:57): same as Raw-LV hook but also dumps FULL 4MB buffers of idx 2,45,55,5,18 -> ML/LOGS/
+RWxx.BIN (~20MB). NEXT: user runs it in movie LV; render full frames (14-bit @ matching width + 16-bit for
+idx5) -> the coherent Bayer scene = THE RAW + its channel + true geometry.
+
+NOTE (strategy): for 4K RAW VIDEO the sensor-raw-in-movie-mode IS the source (can't disable the sensor);
+what gets suppressed in real raw recording is the PREVIEW/display (bandwidth), not the sensor. This LV work
+finds the tap point that recording reuses. (Full-res raw STILLS would be a different, higher-res readout.)

@@ -1605,11 +1605,13 @@ void rawhk_wrapper(uint32_t chan, uint32_t addr)
 /* set by the "Raw-LV hook" wrapper: enable Canon's raw LV (lv_set_mm/lv_save_raw) before hooking, so the
  * +0xa0 hook captures the channel Canon programs with the 14-bit RAW buffer (no EVF hook, no commandeering). */
 static int rawhk_rawlv = 0;
+static int rawhk_dumpfull = 0;
 static void rawhk_task(void)
 {
     gui_stop_menu();
     msleep(500);
     int rawlv = rawhk_rawlv; rawhk_rawlv = 0;
+    int dumpfull = rawhk_dumpfull; rawhk_dumpfull = 0;
     if (rawlv && !lv) { NotifyBox(5000, "Raw-LV hook: enter LiveView first"); return; }
     for (int i = 0; i < RAWHK_NCH; i++) { rawhk_addr[i] = 0; rawhk_hits[i] = 0; }
     rawhk_on = 0; rawhk_total = 0;
@@ -1672,6 +1674,22 @@ static void rawhk_task(void)
             bn += 0x20000u;
         }
     }
+    if (dumpfull)
+    {
+        /* dump FULL 4MB buffers of the 14-bit/16-bit raw candidates (distinct a0s) -> ML/LOGS/RWxx.BIN,
+         * for full-frame rendering (128KB top-sliver was inconclusive). Buffers stay live (raw mode on). */
+        static const int cand[] = {2, 45, 55, 5, 18};
+        for (unsigned ci = 0; ci < sizeof(cand) / sizeof(cand[0]); ci++)
+        {
+            int c = cand[ci];
+            if (c >= RAWHK_NCH || !rawhk_hits[c]) continue;
+            uint32_t cp = rawhk_addr[c] & ~0x40000000u;
+            if (cp < 0x01000000u || cp >= 0x60000000u) continue;
+            char nm[32]; snprintf(nm, sizeof(nm), "ML/LOGS/RW%d.BIN", c);
+            FILE * df = FIO_CreateFile(nm);
+            if (df) { for (uint32_t o = 0; o < 0x400000u; o += 0x10000u) FIO_WriteFile(df, (void *)UNCACHEABLE(cp + o), 0x10000u); FIO_CloseFile(df); }
+        }
+    }
     msleep(2000);
     rawhk_on = 0;
     msleep(50);
@@ -1706,6 +1724,10 @@ static void rawhk_task(void)
 /* "Raw-LV hook": enable Canon raw LV (lv_set_mm/lv_save_raw) then run the +0xa0 hook in plain LiveView --
  * the safe way to find the 14-bit RAW buffer (no EVF hook = no EvfCap crash; no channel commandeer = no Err70). */
 static void rawlv_hook_task(void) { rawhk_rawlv = 1; rawhk_task(); }
+
+/* "Raw-LV dump": like Raw-LV hook, but also dumps the FULL 4MB buffer of each 14/16-bit raw candidate
+ * (idx 2,45,55,5,18) -> ML/LOGS/RWxx.BIN, to render full frames and confirm which is the Bayer raw. */
+static void rawlv_dump_task(void) { rawhk_rawlv = 1; rawhk_dumpfull = 1; rawhk_task(); }
 
 /* ---- EXPERIMENTAL SLURP (Debug -> "Slurp raw").  Pull the sensor 14-bit raw into OUR buffer the
  * mlv_lite way: commandeer a FREE write EDMAC channel and connect it to the sensor raw SOURCE
@@ -2558,6 +2580,13 @@ static struct menu_entry debug_menus[] = {
         .select      = run_in_separate_task,
         .help  = "In movie LiveView (NO rec): enables Canon raw LV (lv_set_mm+lv_save_raw) then +0xa0 hooks.",
         .help2 = "Safe raw-buffer finder (no EVF hook/no commandeer). -> ML/LOGS/RAWHK.TXT + RAWHKB.BIN.",
+    },
+    {
+        .name        = "Raw-LV dump",
+        .priv        = rawlv_dump_task,
+        .select      = run_in_separate_task,
+        .help  = "In movie LiveView (NO rec): Raw-LV hook + dumps FULL buffers of raw candidates (4MB each).",
+        .help2 = "For full-frame Bayer confirmation. -> ML/LOGS/RW2/45/55/5/18.BIN (~20MB, ~20s).",
     },
     {
         .name        = "Slurp raw",
