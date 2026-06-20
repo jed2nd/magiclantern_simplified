@@ -238,3 +238,18 @@ whether we even need it -- if conn0 already carries 14-bit Bayer in LV, no RAW_T
 capture is debayered/8-bit, THEN RE lv raw-type. Likewise the real LV raw geometry: the rendered first
 capture reveals the true width (autocorrelation/structure), so 1920x1080 is just a starting guess. Net:
 unblock by capturing first, then tune RAW_TYPE/geometry from the actual data. Waiting on EVFLOG.TXT.
+
+### EVFLOG result (movie-mode LiveView, 2026-06-20 13:13) -- 0x77c4 VALID, readout = input 5
+"Log EVF xitions" output:
+```
+EVF @00de8c58 type=StateObject name=EvfState inputs=16 states=8 cur=5
+in=6 old=5 new=5 : 120
+in=3 old=5 new=5 : 120
+in=4 old=5 new=5 : 120
+in=5 old=5 new=5 : 120
+```
+EVF_STATE(0x77c4) -> a real "EvfState" StateObject @0xde8c58 (16 inputs, 8 states). In steady LV (state 5)
+each frame fires 4 inputs (3,4,5,6), all old=5->new=5, each 120x over 4s = **30fps**. **input=5,old=5 =
+evfReadOutDoneInterrupt** (matches ML's DIGIC-V CONFIG_EVF_STATE_SYNC convention). => SS_IN=5/SS_OLD=5
+(already the placeholder) is correct for the frame-synced slurp. Fallbacks if 5 doesn't yield raw: 6, 4, 3.
+=> Deploying "Sync slurp" with the EVF spy arming at (input 5, old 5).
