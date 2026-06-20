@@ -1978,6 +1978,76 @@ static void raw_catch_task(void)
     }
     else NotifyBox(12000, "0xD0487000 a0=%08x (no buffer captured)", (unsigned)ptr);
 }
+
+/* ---- RECORDING-WINDOW SAMPLER (Debug -> "Sample raw (REC)").  The prime raw suspect idx23
+ * (0xD0487000) faults when idle and can't be read safely without novel exception code, so instead we
+ * sample the CONFIRMED-SAFE (non-faulting) wide imaging-WRITE channels -- idx1-8 (0xD0420000..0700,
+ * the sensor front-end, UPSTREAM of the Mem1 output), idx14 (P14), idx17/18 (0xD045E000/100) -- over a
+ * ~25s window while you RECORD.  Recording activates the front-end pipeline, so the live raw may appear
+ * on one of these.  Per round (1/s) we read +0xa0 (safe), checksum 1KB of the pointed buffer, and log
+ * channels whose content CHANGES (= live).  The first few active+changing channels are snapshotted to
+ * RAM (2MB) mid-window and written AFTER you stop (no SD writes during recording).  -> RW*.BIN + RECWIN.TXT.
+ * Fully boot-safe (menu task) and run-safe (no faulting reads). */
+static void raw_recwin_task(void)
+{
+    gui_stop_menu();
+    msleep(300);
+    static const uint32_t ch[] = {
+        0xD0420000u, 0xD0420100u, 0xD0420200u, 0xD0420300u, 0xD0420400u, 0xD0420500u, 0xD0420600u, 0xD0420700u,
+        0xD0440000u, 0xD045E000u, 0xD045E100u,
+    };
+    const int NCH = (int)(sizeof(ch) / sizeof(ch[0]));
+    static uint32_t prevchk[16];
+    static void *   cap[16];
+    static uint32_t capsz[16];
+    for (int i = 0; i < 16; i++) { prevchk[i] = 0; cap[i] = 0; capsz[i] = 0; }
+    static char lg[6500]; int n = 0;
+    int total_cap = 0;
+    n += snprintf(lg + n, sizeof(lg) - n, "REC-WINDOW sampler: SAFE wide chans sampled while recording.\n");
+    NotifyBox(8000, "REC WINDOW: START RECORDING now -- sampling 25s");
+    beep();
+    for (int round = 0; round < 25 && n < (int)sizeof(lg) - 300; round++)
+    {
+        for (int i = 0; i < NCH; i++)
+        {
+            uint32_t a0 = *(volatile uint32_t *)(ch[i] + 0xa0u);   /* SAFE channel -- never faults */
+            uint32_t cp = a0 & ~0x40000000u;
+            uint32_t chk = 0;
+            if (cp >= 0x01000000u && cp < 0x60000000u)
+            {
+                const volatile uint32_t * p = (const volatile uint32_t *)UNCACHEABLE(cp);
+                for (int w = 0; w < 256; w++) chk += p[w];   /* cheap 1KB content checksum */
+            }
+            if (a0 && chk != prevchk[i])
+            {
+                n += snprintf(lg + n, sizeof(lg) - n, "r%d ch%x a0=%08x 50=%08x 54=%08x chk=%08x%s\n",
+                    round, (unsigned)((ch[i] >> 8) & 0xffff), (unsigned)a0,
+                    (unsigned)*(volatile uint32_t *)(ch[i] + 0x50u), (unsigned)*(volatile uint32_t *)(ch[i] + 0x54u),
+                    (unsigned)chk, prevchk[i] ? " CHG" : "");
+                /* snapshot active+changing channels (mid-window, after pipeline settles), max 4 */
+                if (!cap[i] && round >= 3 && total_cap < 4 && cp >= 0x01000000u && cp < 0x60000000u)
+                {
+                    cap[i] = fio_malloc(0x200000u);
+                    if (cap[i]) { capsz[i] = 0x200000u; memcpy(cap[i], (void *)UNCACHEABLE(cp & ~0x000FFFFFu), 0x200000u); total_cap++; }
+                }
+            }
+            prevchk[i] = chk;
+        }
+        msleep(1000);
+    }
+    FILE * t = FIO_CreateFile("ML/LOGS/RECWIN.TXT");
+    if (t) { FIO_WriteFile(t, lg, n); FIO_CloseFile(t); }
+    int dumped = 0;
+    for (int i = 0; i < NCH; i++)
+    {
+        if (!cap[i]) continue;
+        char fn[28]; snprintf(fn, sizeof(fn), "ML/LOGS/RW%x.BIN", (unsigned)((ch[i] >> 8) & 0xffff));
+        FILE * f = FIO_CreateFile(fn);
+        if (f) { for (uint32_t off = 0; off < capsz[i]; off += 0x10000u) FIO_WriteFile(f, (uint8_t *)cap[i] + off, 0x10000); FIO_CloseFile(f); dumped++; }
+        fio_free(cap[i]);
+    }
+    NotifyBox(12000, "REC window: %d chans captured -> RW*.BIN + RECWIN.TXT", dumped);
+}
 #endif
 
 #ifdef FEATURE_DEBUG_PROP_DISPLAY
@@ -2332,6 +2402,13 @@ static struct menu_entry debug_menus[] = {
         .select      = run_in_separate_task,
         .help  = "ARM, then press REC: catches the raw channel 0xD0487000 while it's powered.",
         .help2 = "Captures buffer to RAM during recording, writes RC487.BIN after stop (+ RC487.TXT).",
+    },
+    {
+        .name        = "Sample raw (REC)",
+        .priv        = raw_recwin_task,
+        .select      = run_in_separate_task,
+        .help  = "SELECT then RECORD ~25s: samples the SAFE wide channels (idx1-8/14/17/18).",
+        .help2 = "Safe (no faulting reads). Logs live channels -> RECWIN.TXT, snapshots -> RW*.BIN.",
     },
 #endif
     MENU_PLACEHOLDER("Free Memory"),
