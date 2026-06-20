@@ -1769,22 +1769,28 @@ static void raw_bright_task(void)
     /* read the buffer pointer ONCE (channel active now), then read the BUFFER (RAM) each tick -- RAM
      * never deactivates, so a screen-sleep can't fault the read; chk just freezes if the DMA stops. */
     uint32_t bufaddr = *(volatile uint32_t *)(RAW_LV_CH_BASE + RAW_LV_ADDR_OFF);
-    static char b[4000]; int n = 0;
+    static char b[5500]; int n = 0;
     n += snprintf(b + n, sizeof(b) - n,
-        "P14 raw buf=%08x. avg(byte)+chk of 64KB every 250ms x80 (~20s). LV sleeps ~2-5s in.\n"
-        "chk STILL CHANGING after the sleep => raw DMA is display-independent = overnight-proof.\n",
+        "P14 raw buf=%08x. Reading CACHED vs UNCACHED(|0x40000000) alias, 64KB, every 250ms x80 (~20s).\n"
+        "uchk varying = LIVE raw off EDMAC (DMA bypasses cpu cache). cchk is the stale cached view.\n",
         (unsigned)bufaddr);
     if (bufaddr < 0x01000000 || bufaddr >= 0x20000000)
     {
         NotifyBox(6000, "Raw bright: bad buf ptr %08x (LV not active?)", (unsigned)bufaddr);
         return;
     }
-    const volatile uint8_t * p = (const volatile uint8_t *)bufaddr;
-    for (int t = 0; t < 80 && n < (int)sizeof(b) - 48; t++)
+    const volatile uint8_t * pc = (const volatile uint8_t *)CACHEABLE(bufaddr);    /* cached (stale) */
+    const volatile uint8_t * pu = (const volatile uint8_t *)UNCACHEABLE(bufaddr);  /* uncached (live DMA) */
+    for (int t = 0; t < 80 && n < (int)sizeof(b) - 64; t++)
     {
-        uint32_t sum = 0, chk = 0;
-        for (int i = 0; i < 0x10000; i += 16) { uint8_t v = p[i]; sum += v; chk = chk * 31 + v; }
-        n += snprintf(b + n, sizeof(b) - n, "t=%d avg=%d chk=%08x\n", t, (int)(sum / (0x10000 / 16)), (unsigned)chk);
+        uint32_t sc = 0, kc = 0, su = 0, ku = 0;
+        for (int i = 0; i < 0x10000; i += 16)
+        {
+            uint8_t vc = pc[i]; sc += vc; kc = kc * 31 + vc;
+            uint8_t vu = pu[i]; su += vu; ku = ku * 31 + vu;
+        }
+        n += snprintf(b + n, sizeof(b) - n, "t=%d cav=%d cchk=%08x | uav=%d uchk=%08x\n",
+            t, (int)(sc / (0x10000 / 16)), (unsigned)kc, (int)(su / (0x10000 / 16)), (unsigned)ku);
         if ((t & 3) == 0)   /* flush every ~1s */
         {
             FILE * f = FIO_CreateFile("ML/LOGS/RAWBR.TXT");
