@@ -138,7 +138,13 @@ StartEDmac(free_chan, 0);                                // 0xE053595E ; +0xb4 =
 pipeline is hot (recording). ConnectWriteEDmac asserts the channel has a valid BoomerID
 (`DmacBoomerInfo[port].BoomerID != -1`, table ptr `0xE05361F8` stride 0xc) and is a WRITE channel.
 
-Open variables: a **free write channel** with a BoomerID (one NOT in the `FUN_e05364b6` hook log:
-idx0,1,3,7,9,10,12,13,15,16,20,22,25,32-38 — experiment), the actual **width/height**, and whether a
-parallel connection to conn 0 disrupts Canon's recording. Iterate by camera test until a coherent Bayer
-frame lands (pixel-level Bayer test: adjacent-pixel diff >> alternate-pixel diff).
+### Free write channels for the slurp (DmacBoomerInfo @ `0xE0DD608C`, stride 0xc)
+BoomerID (word0 of each entry) = `boomer_index << 16`; `0xFFFFFFFF` = not connectable (idx0, idx32, idx39).
+Channels FREE (not in the `FUN_e05364b6` hook log) + WRITE + connectable → **slurp candidates:
+idx1, idx3, idx7, idx9, idx10, idx12, idx13** (also idx15/16/20/22/25/33-38). Used-by-Canon (avoid):
+idx2/4/5/6/8/11/18/19/27/30/31. **Start with idx7** (free, mid-range), try others if it doesn't carry raw.
+
+Remaining open variables: the actual **width/height** (guess a common LV-raw res first, e.g. 1920×1080 or
+the EOS R 1736-ish; the qemu geometry formula tells us xb/yb), and whether a parallel connection to conn 0
+disrupts Canon's recording (mlv_lite reads conn 0 in parallel, so it should be OK — verify by camera test).
+Iterate channel/conn/geometry until a coherent Bayer frame lands (pixel Bayer test: adjacent >> alternate).
