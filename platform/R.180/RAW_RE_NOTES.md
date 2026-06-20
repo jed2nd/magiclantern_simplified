@@ -173,3 +173,31 @@ our 1920x1080 is a guess). NEXT (md5 920afc3c): STAGED slurp -- writes "last ste
 (truncating) + NotifyBox before each op, so the card pinpoints the disrupting step even if Err 70 aborts.
 Likely real fix = the mlv_lite way: frame-SYNCED slurp via an LV vsync hook (raw_lv_vsync), not a one-shot
 mid-frame setup; and/or ML's own raw LV (not during Canon H264). Iterating.
+
+## 8. The ROBUST path: frame-synced slurp via the EVF state-object hook (mlv_lite's real method)
+Err 70 came from a ONE-SHOT slurp setup mid-frame. mlv_lite never does that -- it slurps from a per-frame
+**vsync hook**, synced to the sensor readout. ML already has the whole mechanism (src/state-object.c):
+- `state_init` (INIT_FUNC) installs `stateobj_lv_spy` on `EVF_STATE` via `stateobj_start_spy` (swaps the
+  state object's `StateTransition_maybe` for our spy, keeping the original).
+- The spy runs on every transition; on the readout-done transition (`EVF_STATE && input==5 && old_state==5`,
+  "evfReadOutDoneInterrupt") under `CONFIG_EVF_STATE_SYNC` it calls `vsync_func()` -> `raw_lv_vsync()`
+  (raw.c:2129) -> `edmac_raw_slurp()` (edmac-memcpy.c:399). THAT is the frame-synced slurp.
+
+**Status on the R: DISABLED.** `platform/R.180/internals.h:30` has `//#define CONFIG_STATE_OBJECT_HOOKS`
+(commented out); `CONFIG_EVF_STATE_SYNC` and `CONFIG_EDMAC_RAW_SLURP` are not defined. But the pointer IS
+ported: `platform/R.180/include/platform/state-object.h` -> `EVF_STATE = *(struct state_object**)0x77c4`.
+ROM has `"EVF_STATE"` @ `0xE0056324` (name, from `"LiveView::EvfState.c"` @ 0xE0056268) and a separate
+`"EVFDEV_STATE"`/`"LiveViewDrive::EvfState.c"`. So 0x77c4 should hold the LiveView EvfState object.
+
+**Enablement plan (the robust slurp, boot-affecting -> do carefully):**
+1. RUNTIME-verify the readout-done transition first (menu-invoked spy, install/log/uninstall like rawhk --
+   NOT a boot change): hook `EVF_STATE->StateTransition`, log (input,old_state,new_state) for a few seconds,
+   find the transition that fires exactly once/frame at the sensor readout. Confirms input/old_state (the R
+   DIGIC8 EVF matrix may differ from the DIGIC-V `5/5` convention).
+2. Then enable `CONFIG_STATE_OBJECT_HOOKS` + `CONFIG_EVF_STATE_SYNC` (+ the verified transition) +
+   `CONFIG_EDMAC_RAW_SLURP`, wire `edmac_raw_slurp` to our free channel/conn0/geometry. The slurp then runs
+   frame-synced -> should NOT trip Err 70 (it's exactly when Canon expects the channel active).
+3. Gate it behind a menu flag so boot stays clean if the transition guess is wrong.
+GATING DECISION: wait for the staged slurp result (which op trips Err 70). If `start` -> frame-sync is the
+fix (this path). If `connw` -> the conn0 tap itself conflicts (need a different conn/chan). If `setedmac`
+-> geometry. The transition logger (step 1) is the next camera build either way (characterizes LV timing).
