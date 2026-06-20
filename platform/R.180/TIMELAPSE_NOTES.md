@@ -19,7 +19,7 @@ Tracks adapt_cur_shutter/iso internally (R shutter dial read is unreliable; we o
 
 ## Build progress
 - [x] STEP 1+2: get_lv_avg_luma() + adaptive_exposure_step() + CONFIG_INT tunables. Compiles, qemu OK.
-- [ ] STEP 3: "Adaptive exposure" menu group next to Intervalometer (on/off, target, shutter/ISO bounds).
+- [x] STEP 3: "Adaptive exposure" controls added as Intervalometer submenu children (on/off, target, max step, shutter floor/ceiling, ISO ceiling). Compiles, qemu OK. _bss_end=0x144100 (watch budget).
 - [ ] STEP 4: wire adaptive_exposure_step() into the intervalometer inter-shot path.
 - [ ] camera test: intervalometer + adaptive ON, dim a light, confirm frames stay even.
 Tunables (defaults): target 92, maxstep 3, shut [40..152], iso [72..112] (ISO100..6400). Tune on camera.
