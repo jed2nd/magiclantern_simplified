@@ -1869,6 +1869,60 @@ static void raw_dump_task(void)
     if (t) { FIO_WriteFile(t, m, k); FIO_CloseFile(t); }
     NotifyBox(8000, "Dumped 8MB @ %08x (ptr %08x) -> RAW.BIN", (unsigned)base, (unsigned)ptr);
 }
+
+/* ---- RAW CANDIDATE PROBE (Debug -> "Dump raw cands").  idx8 (0xD0420700) was DEBUNKED (a stats
+ * buffer, not the raw).  The real sensor raw goes via DprawHeadToRaw/Mem1 -> a WIDE imaging-class
+ * WRITE EDMAC channel.  The 200D/6D2 (DIGIC7 cousins) put it at index 23 ("Mem1 is Not Complete").
+ * On R the wide (0x1c/0x1e transfer) imaging WRITE channels are: idx17/18 (0xD045E000/100, safe),
+ * idx14 P14, and idx23/24 (0xD0487000/100) + idx26-28 (0xD04A2000-200) which FAULT on idle reads
+ * (they power up only when the raw path runs).  Run this in MOVIE LiveView so they're powered.
+ * Crash-bisect: LASTCH.TXT names the channel we're about to read (closed=flushed) so a fault on an
+ * unpowered channel is identifiable after reboot. Each channel with a valid +0xa0 buffer -> 4MB dump. */
+static void raw_cand_task(void)
+{
+    gui_stop_menu();
+    msleep(300);
+    static const uint32_t cand[] = {
+        0xD045E000u, 0xD045E100u, 0xD0440000u,                            /* idx17,18,14 -- safe region */
+        0xD0487000u, 0xD0487100u, 0xD04A2000u, 0xD04A2100u, 0xD04A2200u,  /* idx23,24,26,27,28 -- fault-risk */
+    };
+    FILE * t = FIO_CreateFile("ML/LOGS/RAWCAND.TXT");
+    if (t) { const char * h = "raw candidate probe (wide imaging WRITE chans). RUN IN MOVIE LV.\n"; FIO_WriteFile(t, h, strlen(h)); }
+    int dumped = 0;
+    for (int i = 0; i < (int)(sizeof(cand) / sizeof(cand[0])); i++)
+    {
+        uint32_t ch = cand[i];
+        /* crash-bisect marker -- create+close flushes it to SD BEFORE the risky MMIO read */
+        FILE * mk = FIO_CreateFile("ML/LOGS/LASTCH.TXT");
+        if (mk) { char b[48]; int n = snprintf(b, sizeof(b), "about to read chan %08x (i=%d)\n", (unsigned)ch, i); FIO_WriteFile(mk, b, n); FIO_CloseFile(mk); }
+        /* potentially-faulting reads (channel register block) */
+        uint32_t ptr = *(volatile uint32_t *)(ch + 0xa0u);
+        uint32_t g50 = *(volatile uint32_t *)(ch + 0x50u);
+        uint32_t g54 = *(volatile uint32_t *)(ch + 0x54u);
+        uint32_t cp  = ptr & ~0x40000000u;
+        char b[176]; int n = snprintf(b, sizeof(b), "i=%d chan %08x: a0=%08x 50=%08x 54=%08x", i, (unsigned)ch, (unsigned)ptr, (unsigned)g50, (unsigned)g54);
+        if (cp >= 0x01000000u && cp < 0x60000000u)
+        {
+            char fn[28]; snprintf(fn, sizeof(fn), "ML/LOGS/RC%d.BIN", i);
+            FILE * f = FIO_CreateFile(fn);
+            if (f)
+            {
+                const uint8_t * src = (const uint8_t *)UNCACHEABLE(cp & ~0x000FFFFFu);
+                for (uint32_t off = 0; off < 0x400000u; off += 0x10000u) FIO_WriteFile(f, src + off, 0x10000);
+                FIO_CloseFile(f);
+                n += snprintf(b + n, sizeof(b) - n, " -> RC%d.BIN 4MB @%08x", i, (unsigned)(cp & ~0x000FFFFFu));
+                dumped++;
+            }
+        }
+        else n += snprintf(b + n, sizeof(b) - n, " (no valid buffer)");
+        n += snprintf(b + n, sizeof(b) - n, "\n");
+        if (t) FIO_WriteFile(t, b, n);
+    }
+    if (t) FIO_CloseFile(t);
+    FILE * mk = FIO_CreateFile("ML/LOGS/LASTCH.TXT");
+    if (mk) { const char * d = "done -- no fault\n"; FIO_WriteFile(mk, d, strlen(d)); FIO_CloseFile(mk); }
+    NotifyBox(10000, "Raw cand probe: %d chans dumped -> RC*.BIN", dumped);
+}
 #endif
 
 #ifdef FEATURE_DEBUG_PROP_DISPLAY
@@ -2209,6 +2263,13 @@ static struct menu_entry debug_menus[] = {
         .select      = run_in_separate_task,
         .help  = "IN LIVEVIEW (hold half-press): dump 8MB of the live D0420700+0xa0 buffer.",
         .help2 = "For PC render to confirm a moving image. -> ML/LOGS/RAW.BIN (+ RAW.TXT).",
+    },
+    {
+        .name        = "Dump raw cands",
+        .priv        = raw_cand_task,
+        .select      = run_in_separate_task,
+        .help  = "IN MOVIE LIVEVIEW: dump the WIDE imaging-write channels (idx17/18/23/24/26-28).",
+        .help2 = "Hunts the real Mem1/HeadToRaw channel. -> ML/LOGS/RC*.BIN + RAWCAND.TXT (crash-bisect LASTCH.TXT).",
     },
 #endif
     MENU_PLACEHOLDER("Free Memory"),
