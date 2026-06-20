@@ -307,3 +307,25 @@ whereas small buffers (idx30) read stable. RE-TARGETED "Raw-LV dump" -> cand {2,
 30/64/69) ARE dumpable. NEXT: user re-runs in movie LV pointing at the (detailed) scene; render all ->
 the channel showing the scene with Bayer mosaic = THE RAW. (If wide ones still tear, add a per-channel
 freeze: stop +0xb4 on non-faulting candidates before dump.)
+
+## 11. KEY REFRAME: the R's raw IS "Dpraw" = Dual Pixel RAW (DPAF). Cache + IRQ notes.
+External review (Gemini) + our own sec-3 findings converge: the R raw pipeline is the **"Dpraw" = Dual
+Pixel RAW** path (DprawHeadToRaw / DprawSap_Start / DprawCorrection). The R sensor is Dual Pixel CMOS AF --
+every photosite has TWO photodiodes (A,B). So the raw buffer likely carries dual-pixel structure (A/B
+interleaved per-column or as separate planes), NOT a plain single-pixel Bayer raster. **This probably
+explains the streak/shear artifacts** in the wide dumps (idx2 etc.): a single-pixel width is half (or
+double) the true layout. -> render with de-interleave: A=even cols, B=odd cols, and A+B sum (the normal
+image is A+B). Added eosr_port/render_dpraw.py for this.
+
+Cross-check vs the three classic DIGIC-8 raw traps (all already addressed by our approach):
+1. CACHE COHERENCY -- HANDLED. R uncacheable alias = phys | 0x40000000 (mem_defs.h). We point EDMAC dest
+   AND our reads at the uncached alias (UNCACHEABLE(cp)); no stale-cache reads.
+2. EDMAC COMPLETION-IRQ HEARTBEAT -- this is why the earlier commandeer-a-channel slurp threw Err 70 +
+   reboot: StartEDmac on a free channel WITHOUT RegisterEDmacComplete/Abort/PopCBR -> firmware saw a
+   missing completion heartbeat -> Err 70 / state-machine crash. ***Our pivot SIDESTEPS this***: Raw-LV
+   hook does NOT redirect/commandeer any EDMAC -- it enables Canon's own raw LV (lv_save_raw) and READS the
+   buffer Canon fills, leaving Canon's IRQ/CBR machinery fully intact. (If we later need our own channel,
+   we MUST register the completion CBRs, like mlv_lite edmac_raw_slurp does.)
+3. CORRECT CHANNEL (FE raw before IPP, not display/EVF/DPAF-phase) -- exactly the current hunt: find the
+   channel whose buffer is FE Bayer (pre-IPP) vs the debayered IPP previews. idx30 confirmed the scene;
+   re-targeted dump {2,30,19,64,69,8} to find the Bayer (likely dual-pixel) one.
