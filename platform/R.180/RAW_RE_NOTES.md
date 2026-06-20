@@ -201,3 +201,19 @@ ROM has `"EVF_STATE"` @ `0xE0056324` (name, from `"LiveView::EvfState.c"` @ 0xE0
 GATING DECISION: wait for the staged slurp result (which op trips Err 70). If `start` -> frame-sync is the
 fix (this path). If `connw` -> the conn0 tap itself conflicts (need a different conn/chan). If `setedmac`
 -> geometry. The transition logger (step 1) is the next camera build either way (characterizes LV timing).
+
+### Slurp diagnostic result: Err 70 is at the `start` step -> frame-sync is the fix (CONFIRMED)
+Staged slurp reported "last step reached: start". So setbuf + setedmac + connw ALL succeed (no Err 70):
+**the geometry/edmac_info config is valid, and ConnectWriteEDmac(idx7, 0) tapping the sensor raw source
+does NOT conflict with Canon.** Only StartEDmac (FUN_e053595e: +8=0x12, DSB, +0xb4=1) trips Err 70 --
+starting the transfer mid-frame breaks the engine's per-frame consistency. => the slurp must be STARTED
+from the per-frame readout transition (the vsync hook), exactly like mlv_lite's raw_lv_vsync ->
+edmac_raw_slurp (re-armed every frame). This is the robust path (sec 8). Also noted from edmac_raw_slurp:
+it RegisterEDmacComplete/Abort/PopCBR before starting, and raw_lv_vsync sets RAW_TYPE_REGISTER every frame.
+
+### Built: "Log EVF xitions" (evflog_task) -- find the readout/vsync transition (md5 e4edaeba @ now)
+Menu task: runtime-swaps EVF_STATE(0x77c4)->StateTransition_maybe(+0x0c) for a spy that tallies
+(input,old_state,new_state) for 4s in LiveView, then restores (DATA-ptr swap, recoverable). Also logs the
+EVF object identity (type/name/max_inputs/max_states). -> ML/LOGS/EVFLOG.TXT. The transition whose count ~=
+the LV frame count (~120 over 4s @30fps) is the readout-done (vsync) point. NEXT: user runs it in LV; read
+EVFLOG.TXT -> that (input,old_state) is the R's CONFIG_EVF_STATE_SYNC transition for the frame-synced slurp.

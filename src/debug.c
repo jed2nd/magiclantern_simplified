@@ -24,6 +24,8 @@
 #include "lvinfo.h"
 #include "raw.h"
 #include "rom_values.h"
+#include "state-object.h"
+#include <platform/state-object.h>
 
 #ifdef CONFIG_DEBUG_INTERCEPT
 #include "dm-spy.h"
@@ -1754,6 +1756,73 @@ static void slurp_raw_task(void)
     NotifyBox(12000, "slurp idx7 done -> SLURP.BIN (stop recording)");
 }
 
+/* ---- EVF-transition logger (Debug -> "Log EVF xitions").  The slurp's StartEDmac trips Err 70 because
+ * it fires mid-frame; the robust fix is to start it from the per-frame readout-done transition (the vsync
+ * point ML uses for edmac_raw_slurp). This finds that transition: runtime-swap EVF_STATE(0x77c4)->
+ * StateTransition_maybe (+0x0c) for a spy that tallies (input,old_state,new_state) for a few seconds, then
+ * restores. DATA-ptr swap (not a code patch) -> menu-invoked, recoverable. The once-per-LV-frame entry =
+ * the readout-done transition we sync the slurp to. -> ML/LOGS/EVFLOG.TXT. */
+static int (*evf_orig_st)(struct state_object *, int, int, int, int) = 0;
+static volatile int evflog_on = 0;
+#define EVFLOG_MAX 48
+static uint32_t evflog_key[EVFLOG_MAX];   /* (input<<16)|(old<<8)|new */
+static uint32_t evflog_cnt[EVFLOG_MAX];
+static volatile int evflog_n = 0;
+
+static int FAST evf_spy(struct state_object * self, int x, int input, int z, int t)
+{
+    int old = self->current_state;
+    int ans = evf_orig_st(self, x, input, z, t);
+    if (evflog_on)
+    {
+        uint32_t key = ((input & 0xff) << 16) | ((old & 0xff) << 8) | (self->current_state & 0xff);
+        int i;
+        for (i = 0; i < evflog_n; i++) if (evflog_key[i] == key) { evflog_cnt[i]++; break; }
+        if (i == evflog_n && evflog_n < EVFLOG_MAX) { evflog_key[evflog_n] = key; evflog_cnt[evflog_n] = 1; evflog_n++; }
+    }
+    return ans;
+}
+
+static void evflog_task(void)
+{
+    gui_stop_menu();
+    msleep(500);
+    if (!lv) { NotifyBox(5000, "EVFlog: enter LiveView first"); return; }
+    struct state_object * evf = EVF_STATE;
+    if (!evf) { NotifyBox(5000, "EVFlog: EVF_STATE(0x77c4) is null"); return; }
+
+    static char hdr[220]; int hn = 0;
+    hn += snprintf(hdr + hn, sizeof(hdr) - hn, "EVF @%08x type=%s name=%s inputs=%d states=%d cur=%d\n",
+                   (unsigned)(uintptr_t)evf, evf->type ? evf->type : "?", evf->name ? evf->name : "?",
+                   (int)evf->max_inputs, (int)evf->max_states, (int)evf->current_state);
+
+    evflog_n = 0;
+    evf_orig_st = (void *)evf->StateTransition_maybe;   /* (void*) intermediate avoids cast-function-type */
+    evf->StateTransition_maybe = (void *)evf_spy;
+    evflog_on = 1;
+    NotifyBox(3500, "EVFlog: sampling transitions 4s (hold still)...");
+    msleep(4000);
+    evflog_on = 0;
+    evf->StateTransition_maybe = (void *)evf_orig_st;   /* restore Canon's handler */
+    msleep(100);
+
+    FILE * f = FIO_CreateFile("ML/LOGS/EVFLOG.TXT");
+    if (f)
+    {
+        FIO_WriteFile(f, hdr, hn);
+        for (int i = 0; i < evflog_n; i++)
+        {
+            static char ln[80];
+            int k = snprintf(ln, sizeof(ln), "in=%2d old=%2d new=%2d : %4d\n",
+                             (int)((evflog_key[i] >> 16) & 0xff), (int)((evflog_key[i] >> 8) & 0xff),
+                             (int)(evflog_key[i] & 0xff), (int)evflog_cnt[i]);
+            FIO_WriteFile(f, ln, k);
+        }
+        FIO_CloseFile(f);
+    }
+    NotifyBox(9000, "EVFlog: %d xition types -> EVFLOG.TXT (~once/frame = readout)", evflog_n);
+}
+
 /* ---- RAW BRIGHTNESS + SCREEN-SLEEP TEST (Debug -> "Raw bright test").
  * We found the LV raw write channel: DmacInfo Port 14 = pBlock 0xD0440000, buffer-pointer reg at
  * +0x50, content = uncompressed Bayer. This averages that buffer over ~80s while logging a checksum,
@@ -2384,6 +2453,13 @@ static struct menu_entry debug_menus[] = {
         .select      = run_in_separate_task,
         .help  = "Select, then press REC + RECORD ~10s: slurp idx7<-sensor-raw(conn0) into our buffer.",
         .help2 = "Experimental mlv_lite-style raw capture. -> ML/LOGS/SLURP.BIN (+SLURP.TXT regs).",
+    },
+    {
+        .name        = "Log EVF xitions",
+        .priv        = evflog_task,
+        .select      = run_in_separate_task,
+        .help  = "In LiveView: spies EVF_STATE transitions 4s to find the once/frame readout (vsync) point.",
+        .help2 = "For the frame-synced slurp. Runtime install/restore (recoverable). -> ML/LOGS/EVFLOG.TXT.",
     },
     {
         .name        = "Raw bright test",
