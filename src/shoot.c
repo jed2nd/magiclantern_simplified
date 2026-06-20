@@ -217,6 +217,74 @@ static CONFIG_INT("bulb.ramping.man.focus", bramp_manual_speed_focus_steps_per_s
 
 static int intervalometer_running = 0;
 int is_intervalometer_running() { return intervalometer_running; }
+
+#ifdef FEATURE_INTERVALOMETER
+/* ===== Adaptive-exposure timelapse (EOS R) =====================================================
+ * Holy-grail day->night ramping for the intervalometer. The R has no raw-LV histogram (so ML's
+ * Auto ETTR can't run here); instead we meter the average LiveView luma and, between shots, nudge
+ * shutter (then ISO) toward a target brightness -- clamped to a small step/shot so the sequence
+ * doesn't flicker. Exposure actuators are the camera-validated R setters (lens_set_rawshutter
+ * hi-byte / lens_set_rawiso byte-1). */
+static CONFIG_INT("adapt.exp.enabled",  adapt_exp_enabled, 0);
+static CONFIG_INT("adapt.exp.target",   adapt_target, 92);        /* target avg luma 0-255 (below mid = headroom) */
+static CONFIG_INT("adapt.exp.maxstep",  adapt_max_step, 3);       /* max ML raw units/shot (8=1 stop) ~= 1/3 stop */
+static CONFIG_INT("adapt.exp.shut.min", adapt_shutter_min, 40);   /* slowest shutter allowed (ML raw) */
+static CONFIG_INT("adapt.exp.shut.max", adapt_shutter_max, 152);  /* fastest shutter allowed (ML raw) */
+static CONFIG_INT("adapt.exp.iso.min",  adapt_iso_min, 72);       /* ISO 100 (ML raw) */
+static CONFIG_INT("adapt.exp.iso.max",  adapt_iso_max, 112);      /* ISO 6400 (ML raw) */
+#define ADAPT_DEADBAND 8
+static int adapt_cur_shutter = -1;
+static int adapt_cur_iso = -1;
+
+/* Average luma (0-255) of the LiveView YUV422 image = the scene brightness itself, off the sensor
+ * feed (independent of the R's uncooperative meter). UYVY: Y in bytes 1 and 3 of each 32-bit word. */
+static int get_lv_avg_luma(void)
+{
+    struct vram_info * lv = get_yuv422_vram();
+    if (!lv || !lv->vram || lv->pitch <= 0 || lv->height <= 0) return -1;
+    const uint32_t * buf = (const uint32_t *)lv->vram;
+    int n32 = (lv->pitch * lv->height) / 4;
+    long sum = 0; int s = 0;
+    for (int p = 0; p < n32; p += 97)   /* sparse prime-ish stride */
+    {
+        uint32_t px = buf[p];
+        sum += ((((px >> 24) & 0xFF) + ((px >> 8) & 0xFF)) >> 1);   /* avg of the 2 Y's */
+        s++;
+    }
+    return s ? (int)(sum / s) : -1;
+}
+
+/* One adaptive-exposure correction toward adapt_target, clamped to adapt_max_step (anti-flicker):
+ * shutter-priority within [shut.min,shut.max], spilling to ISO within [iso.min,iso.max].
+ * Returns the metered avg luma (0-255), or -1 if LV not readable. */
+static int adaptive_exposure_step(void)
+{
+    int avgY = get_lv_avg_luma();
+    if (avgY < 0) return -1;
+    int err = avgY - (int)adapt_target;        /* >0 too bright, <0 too dark */
+    if (err > -ADAPT_DEADBAND && err < ADAPT_DEADBAND) return avgY;   /* close enough -> hold */
+
+    if (adapt_cur_shutter < 0)
+        adapt_cur_shutter = COERCE(lens_info.raw_shutter ? lens_info.raw_shutter : 112, (int)adapt_shutter_min, (int)adapt_shutter_max);
+    if (adapt_cur_iso < 0)
+        adapt_cur_iso = COERCE(lens_info.raw_iso ? lens_info.raw_iso : 72, (int)adapt_iso_min, (int)adapt_iso_max);
+
+    int raw_step = COERCE(err / 12, -(int)adapt_max_step, (int)adapt_max_step);   /* +ve -> faster shutter (darker) */
+    if (raw_step == 0) raw_step = (err > 0) ? 1 : -1;                             /* always cross the deadband */
+
+    int new_shutter = COERCE(adapt_cur_shutter + raw_step, (int)adapt_shutter_min, (int)adapt_shutter_max);
+    int remainder = raw_step - (new_shutter - adapt_cur_shutter);   /* what the shutter range couldn't absorb */
+    adapt_cur_shutter = new_shutter;
+    lens_set_rawshutter(adapt_cur_shutter);
+
+    if (remainder != 0)   /* shutter at a bound -> spill to ISO (bright->lower ISO, dark->higher) */
+    {
+        adapt_cur_iso = COERCE(adapt_cur_iso - remainder, (int)adapt_iso_min, (int)adapt_iso_max);
+        lens_set_rawiso(adapt_cur_iso);
+    }
+    return avgY;
+}
+#endif /* FEATURE_INTERVALOMETER */
 int motion_detect = 0; //int motion_detect_level = 8;
 #ifdef FEATURE_AUDIO_REMOTE_SHOT
 static int audio_release_running = 0;
