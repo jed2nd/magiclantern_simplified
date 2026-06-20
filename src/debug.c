@@ -1799,6 +1799,81 @@ static void slurp_raw_task(void)
     NotifyBox(12000, "slurp idx7 done -> SLURP.BIN (stop recording)");
 }
 
+/* ---- CORRECTED CBR-DRIVEN SLURP (Debug -> "CBR slurp").  The full-res RAW is NOT CPU-buffered (sec 12) ->
+ * slurp it from conn0 in real time the mlv_lite way, WITH the completion CBR registered. That CBR was the
+ * missing IRQ "heartbeat" that made the earlier bare slurp throw Err70/reboot (sec 11); it also gives us
+ * per-frame timing so we don't need the EvfCap-crashing EVF vsync hook. R EDMAC CBR API (decompiled):
+ *   RegisterEDmacCompleteCBR 0xE0535A82 (chan,cbr,ctx -> table@DAT_e0535d98, sets pBlock+0x3c=1)
+ *   UnregisterEDmac*CBR      0xE0535AAE (chan, mask: 0x08=Complete,0x10=Abort,0x20=Pop)
+ * Menu-invoked + recoverable. -> ML/LOGS/SLURP.BIN + SLURPS.TXT. */
+static volatile int ss_cbr_done = 0;
+static volatile int ss_cbr_count = 0;
+static void slurp_complete_cbr(void * ctx) { ss_cbr_count++; ss_cbr_done = 1; }
+
+static void cbrslurp_task(void)
+{
+    gui_stop_menu();
+    msleep(500);
+    if (!lv) { NotifyBox(5000, "CBR slurp: enter movie LiveView first"); return; }
+
+    void (*r_setbuf)(uint32_t, uint32_t)                        = (void *)(0xE05364B6u | 1);
+    void (*r_setedmac)(uint32_t, uint32_t, uint32_t, uint32_t *) = (void *)(0xE0536ABCu | 1);
+    void (*r_regcomplete)(uint32_t, void *, uint32_t)           = (void *)(0xE0535A82u | 1);
+    void (*r_unreg)(uint32_t, uint32_t)                         = (void *)(0xE0535AAEu | 1);
+    void (*r_connw)(uint32_t, uint32_t)                         = (void *)(0xE053607Cu | 1);
+    void (*r_start)(uint32_t)                                   = (void *)(0xE053595Eu | 1);
+    void (*r_stop)(uint32_t)                                    = (void *)(0xE0536142u | 1);
+
+    const uint32_t chan = 7, conn = 0;          /* idx7 = free write chan (not in the 24 active); conn0 = sensor raw */
+    const uint32_t W = 1920, H = 1080;          /* geometry guess (raw is Dpraw -> may need 2x width; iterate) */
+    uint32_t pitch = W * 14u / 8u;
+    uint32_t sz = pitch * H;
+    void * buf = fio_malloc(sz);
+    if (!buf) { NotifyBox(6000, "CBR slurp: fio_malloc %d fail", (int)sz); return; }
+    uint32_t ubuf = (uint32_t)buf | 0x40000000u;
+    memset((void *)ubuf, 0, sz);
+
+    static uint32_t ei[0x16];
+    for (int i = 0; i < 0x16; i++) ei[i] = 0;
+    ei[0x10] = pitch;       /* xb */
+    ei[0x13] = H - 1;       /* yb */
+
+    ss_cbr_done = 0; ss_cbr_count = 0;
+    NotifyBox(13000, "CBR slurp idx7<-conn0: arming (hold still)...");
+    beep();
+    msleep(2000);
+
+    /* mlv_lite order: register completion CBR (heartbeat) -> connect -> buffer+geometry -> start */
+    r_regcomplete(chan, (void *)slurp_complete_cbr, 0);
+    r_connw(chan, conn);
+    r_setbuf(chan, ubuf);
+    r_setedmac(chan, 0, 0, ei);
+    r_start(chan);
+
+    int waited = 0;
+    while (!ss_cbr_done && waited < 2000) { msleep(20); waited += 20; }   /* wait a frame completion (NOT EVF vsync) */
+    msleep(50);
+    r_stop(chan);
+    r_unreg(chan, 0x08u);    /* unregister our completion CBR */
+    msleep(50);
+
+    uint32_t pblock = *(volatile uint32_t *)(0xE0DD5C64u + chan * 8);
+    static char t[260]; int n = 0;
+    n += snprintf(t + n, sizeof(t) - n, "cbrslurp idx%d conn%d %dx%d pitch%d cbr=%d done=%d waited=%dms\nregs:",
+                  (int)chan, (int)conn, (int)W, (int)H, (int)pitch, (int)ss_cbr_count, (int)ss_cbr_done, waited);
+    for (uint32_t off = 0x48; off <= 0x58; off += 4)
+        n += snprintf(t + n, sizeof(t) - n, " %x=%08x", (unsigned)off, (unsigned)*(volatile uint32_t *)(pblock + off));
+    n += snprintf(t + n, sizeof(t) - n, " a0=%08x b4=%08x\n",
+                  (unsigned)*(volatile uint32_t *)(pblock + 0xa0u), (unsigned)*(volatile uint32_t *)(pblock + 0xb4u));
+    FILE * tf = FIO_CreateFile("ML/LOGS/SLURPS.TXT");
+    if (tf) { FIO_WriteFile(tf, t, n); FIO_CloseFile(tf); }
+
+    FILE * f = FIO_CreateFile("ML/LOGS/SLURP.BIN");
+    if (f) { for (uint32_t o = 0; o < sz; o += 0x10000u) { uint32_t cs = sz - o < 0x10000u ? sz - o : 0x10000u; FIO_WriteFile(f, (uint8_t *)ubuf + o, cs); } FIO_CloseFile(f); }
+    fio_free(buf);
+    NotifyBox(11000, "CBR slurp: cbr=%d done=%d -> SLURP.BIN", (int)ss_cbr_count, (int)ss_cbr_done);
+}
+
 /* ---- EVF-transition logger (Debug -> "Log EVF xitions").  The slurp's StartEDmac trips Err 70 because
  * it fires mid-frame; the robust fix is to start it from the per-frame readout-done transition (the vsync
  * point ML uses for edmac_raw_slurp). This finds that transition: runtime-swap EVF_STATE(0x77c4)->
@@ -2595,6 +2670,13 @@ static struct menu_entry debug_menus[] = {
         .select      = run_in_separate_task,
         .help  = "Select, then press REC + RECORD ~10s: slurp idx7<-sensor-raw(conn0) into our buffer.",
         .help2 = "Experimental mlv_lite-style raw capture. -> ML/LOGS/SLURP.BIN (+SLURP.TXT regs).",
+    },
+    {
+        .name        = "CBR slurp",
+        .priv        = cbrslurp_task,
+        .select      = run_in_separate_task,
+        .help  = "In movie LiveView (NO rec): slurp idx7<-conn0 WITH completion CBR (the heartbeat fix).",
+        .help2 = "Corrected mlv_lite slurp -> the full-res Bayer raw. -> ML/LOGS/SLURP.BIN + SLURPS.TXT.",
     },
     {
         .name        = "Log EVF xitions",

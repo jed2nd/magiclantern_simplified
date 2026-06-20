@@ -349,3 +349,23 @@ per sec 11): RegisterEDmacCompleteCBR + AbortCBR + PopCBR on the chan BEFORE Sta
 edmac_raw_slurp does this; I omitted it). The completion CBR ALSO gives per-frame timing -> we can re-arm
 from the CBR instead of the EVF vsync hook (which crashes EvfCap on R). NEXT: RE the R's RegisterEDmacComplete
 CBR / EDmac CBR table; build a CBR-driven slurp (conn0, dual-pixel geometry, CBRs registered); menu-invoked.
+
+## 13. EDMAC completion-CBR API resolved (decompiled) + corrected "CBR slurp" built
+Resolved the R's EDMAC CBR API (was SUSPECT in stubs.S):
+- **RegisterEDmacCompleteCBR = `0xE0535A82`** -- `(chan, cbr, ctx)`: stores cbr@`DAT_e0535d98`+chan*8,
+  ctx@+4, sets **pBlock+0x3c = 1** (enables the completion IRQ), calls FUN_e0554504. THIS is the heartbeat.
+- **Unregister*CBR = `0xE0535AAE`** -- `(chan, mask)`: clears pBlock+0x34/+0x38/+0x3c by mask bits
+  **0x20=Pop(+0x34), 0x10=Abort(+0x38), 0x08=Complete(+0x3c)**.
+- CBR-enable flags live at **pBlock +0x34 (Pop) / +0x38 (Abort) / +0x3c (Complete)**.
+- Confirmed `FUN_e0535a42` = combined start (calls FUN_e0535998 read-start + FUN_e053595e write-start), so
+  **StartEDmac(write)=0xE053595E, StartEDmac(read)=0xE0535998** verified.
+(Abort/Pop register fns not separately located yet -- mlv_lite's CBR is a no-op anyway; Complete is the one
+that matters for the heartbeat. Add Abort/Pop only if Err70 persists.)
+
+Built **"CBR slurp" (cbrslurp_task, md5 2f7d1826 @ 15:11):** movie LiveView (NO rec): RegisterEDmacComplete
+CBR(idx7, cb, 0) -> ConnectWriteEDmac(idx7,0) -> FUN_e05364b6(idx7, ubuf) -> SetEDmac(idx7,0,0,geom) ->
+StartEDmac(idx7); wait for the completion cb (per-frame timing, NOT EVF vsync) up to 2s; stop; unregister;
+copy ubuf -> ML/LOGS/SLURP.BIN + SLURPS.TXT (logs cbr count + regs). Geometry 1920x1080 14-bit guess
+(Dpraw may need 2x width). RISK: still commandeers idx7+conn0 -> if the CBR-heartbeat theory is wrong it may
+Err70/reboot (recoverable, menu-invoked). NEXT: user runs it; SLURPS.TXT cbr>0 + a coherent Bayer SLURP.BIN
+= RAW SLURPED (milestone). If Err70: add Abort/Pop CBRs / rethink. If blank/garbage: iterate geometry/conn.
