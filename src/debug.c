@@ -1854,13 +1854,16 @@ static void raw_dump_task(void)
     for (uint32_t off = 0; off < total; off += 0x10000)
         FIO_WriteFile(f, src + off, 0x10000);
     FIO_CloseFile(f);
-    /* self-document: read the channel's geometry/control registers (safe -- active channel).
-     * +0x48 ys_xs, +0x4c ya_xa, +0x50 yb_xb, +0x54 yn_xn=(yn<<16)|xn (-> width/height), +0xa0 ram_addr. */
-    static const uint16_t go[] = {0x08,0x10,0x18,0x20,0x48,0x4c,0x50,0x54,0x68,0x84,0xa0,0xa4,0xa8,0xac,0xb4,0xc0,0xc4};
-    char m[420]; int k = 0;
-    k += snprintf(m + k, sizeof(m) - k, "RAW.BIN = 8MB from D0420700+0xa0; base=%08x live_ptr=%08x\nregs:", (unsigned)base, (unsigned)ptr);
-    for (int i = 0; i < (int)(sizeof(go)/sizeof(go[0])); i++)
-        k += snprintf(m + k, sizeof(m) - k, " %x=%08x", go[i], (unsigned)*(volatile uint32_t *)(0xD0420700u + go[i]));
+    /* self-document: dump the WHOLE channel register block 0x00..0xFC (safe -- active channel).
+     * Key: +0x48 ys_xs, +0x54 yn_xn=(yn<<16)|xn -> width/height; +0xa0 ram_addr; +0xc0 transfer_mode;
+     * +0xd0 PackUnpackInfo -> bit-depth/format. Non-zero regs only, to keep it compact. */
+    static char m[1500]; int k = 0;
+    k += snprintf(m + k, sizeof(m) - k, "RAW.BIN = 8MB from D0420700+0xa0; base=%08x live_ptr=%08x\nregs(nonzero):", (unsigned)base, (unsigned)ptr);
+    for (int off = 0; off < 0x100 && k < (int)sizeof(m) - 20; off += 4)
+    {
+        uint32_t v = *(volatile uint32_t *)(0xD0420700u + off);
+        if (v) k += snprintf(m + k, sizeof(m) - k, " %x=%08x", off, (unsigned)v);
+    }
     k += snprintf(m + k, sizeof(m) - k, "\n");
     FILE * t = FIO_CreateFile("ML/LOGS/RAW.TXT");
     if (t) { FIO_WriteFile(t, m, k); FIO_CloseFile(t); }
