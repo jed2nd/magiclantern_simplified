@@ -385,3 +385,21 @@ Built STAGED CBR slurp (md5 a04584bc @ 15:27): marker to SLURPS.TXT + NotifyBox 
 (regcomplete/connw/setbuf/setedmac/start/waiting) -> the last marker = the crash step (survives reboot).
 NEXT: user runs it, reports the last on-screen step (or SLURPS.TXT). That localizes the panic so we fix it
 (skip the redundant re-register; or don't re-enable the IRQ; or the conn0 double-write is fundamental).
+
+### Panic mechanism (likely regcomplete): SMP cross-core IRQ re-register
+Decompiled the RegisterInterruptHandler path:
+- `FUN_e0554504`(_,irq,handler,chan) -> `FUN_e011de06`(irq,handler,chan,0); panics (assert) only if the
+  return is NEGATIVE.
+- `FUN_e011de06` with param_4=0 calls `FUN_e011ddce`(irq, cur_cpu) and skips+returns its code on conflict.
+- **`FUN_e011ddce` returns -1 (0xffffffff) iff the IRQ is already registered AND for a DIFFERENT CPU** than
+  the caller's: `if (state!=0 && (1<<cur_cpu & state)==0) return -1;`.
+The R is SMP (CONFIG_TASK_STRUCT_V2_SMP). If Canon registered idx7's EDMAC completion IRQ (0xd1) on core A
+and our menu task runs on core B, RegisterEDmacCompleteCBR -> -1 -> **panic**. This fits the crash+reboot.
+**FIX (if staged shows regcomplete): set the CBR DIRECTLY, skip RegisterInterruptHandler** -- the handler
+0xe05378d7 is already wired (ROM table @0xE0DD641C); just do:
+  *(uint32_t*)(0x00073de8 + chan*8)     = (uint32_t)slurp_complete_cbr;   // cbr table (DAT_e0535d98)
+  *(uint32_t*)(0x00073de8 + chan*8 + 4) = 0;                              // ctx
+  *(volatile uint32_t*)(*(uint32_t*)(0xE0DD5C64 + chan*8) + 0x3c) = 1;    // pBlock+0x3c = completion enable
+i.e. replicate FUN_e0535a82's table writes WITHOUT its FUN_e0554504 call. (If staged shows start/waiting
+instead, the panic is the transfer/ISR on a commandeered free chan -> pivot to a different chan/conn or
+Canon's raw-channel infra, not this fix.)
