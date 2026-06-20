@@ -6243,6 +6243,13 @@ shoot_task( void* unused )
         {
             int seconds_clock_0 = get_seconds_clock();
             int display_turned_off = 0;
+#ifdef FEATURE_INTERVALOMETER
+            /* Adaptive-exposure timelapse: meter the live scene and ramp shutter (then ISO) toward
+             * Target before this frame -- holy-grail day->night. Needs LiveView (the luma meter); the
+             * <= Max-step/shot clamp keeps the ramp flicker-free. Sets the exposure for this shot. */
+            if (adapt_exp_enabled && lv)
+                adaptive_exposure_step();
+#endif
             //~ int images_compared = 0;
             msleep(20);
             while (SECONDS_REMAINING > 1 && !ml_shutdown_requested)
