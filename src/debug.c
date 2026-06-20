@@ -1760,53 +1760,59 @@ static void edmac_scan_task(void)
  * Reads the live channel reg each tick (the channel is active in LV); if a screen-off fully stops LV
  * the reg read could fault -- the per-tick log persists, so the last entry still tells us when it died.
  * -> ML/LOGS/RAWBR.TXT */
-#define RAW_LV_CH_BASE 0xD0440000u   /* P14 pBlock */
-#define RAW_LV_ADDR_OFF 0x50u        /* ram_addr register offset */
 extern void idle_wakeup_reset_counters(int reason);
+/* ---- BREADTH SCAN: which WRITE channel carries the LIVE LV stream? P14 turned out to update its
+ * buffer only on CAPTURE (no cache issue -- cached==uncached==invalidated). So read MANY write-channel
+ * buffer pointers (reg +0x50), checksum each buffer TWICE ~40ms apart (a frame), and flag the ones whose
+ * content CHANGED (CHG=Y) -- that frame-to-frame change is the signature of the live sensor stream.
+ * Crash-bisect: we flush the log BEFORE each channel's register read, so if an inactive channel faults,
+ * the last logged line names the culprit. KEEP LV AWAKE (hold half-press) + VARY THE SCENE.
+ * -> ML/LOGS/RAWBR.TXT */
 static void raw_bright_task(void)
 {
+    /* imaging-likely WRITE-channel pBlocks (DmacInfo @0xE0DD5C64, bit0=WRITE). +0x50 = buffer ptr. */
+    static const uint32_t blk[] = {
+        0xd0404000,
+        0xd0420000,0xd0420100,0xd0420200,0xd0420300,0xd0420400,0xd0420500,0xd0420600,0xd0420700,
+        0xd0440000,0xd0440100,0xd0440200,
+        0xd045e000,0xd045e100,0xd045e200,
+        0xd0487000,0xd0487100,0xd0487200,
+        0xd04a2000,0xd04a2100,0xd04a2200,0xd04a2300,0xd04a2400,0xd04a2500,
+    };
+    const int nb = (int)(sizeof(blk) / sizeof(blk[0]));
     gui_stop_menu();
-    msleep(200);
-    /* LIVENESS DIAGNOSTIC. Earlier test was inconclusive (cached==uncached, frozen) -- possibly because
-     * LV slept before the scene changed, OR the buffer is double-buffered (we read a fixed stale ptr),
-     * OR the uncached alias doesn't bypass cache on the R. This follows the LIVE ptr (+0x50) each tick
-     * and reads it 3 ways: cached, uncached(|0x40000000), and cached-after-explicit-dcache-INVALIDATE
-     * (DCIMVAC). Verdict: if uchk OR ichk varies while the scene changes => LIVE raw. If all 3 frozen
-     * with an active+changing scene => wrong/static buffer (P14 not the live raw). */
-    static char b[6200]; int n = 0;
+    msleep(300);
+    static char b[8000]; int n = 0;
     n += snprintf(b + n, sizeof(b) - n,
-        "P14 live-raw diag: follow ptr@+0x50; cchk=cached uchk=uncached ichk=cached-after-INVALIDATE.\n"
-        "KEEP LV AWAKE (half-press shutter) and VARY THE SCENE the whole time. uchk/ichk changing = LIVE.\n");
-    for (int t = 0; t < 60 && n < (int)sizeof(b) - 80; t++)
+        "BREADTH: per WRITE chan: ptr=*(blk+0x50), then uncached 32KB chk TWICE ~40ms apart.\n"
+        "CHG=Y means buffer changed between reads = LIVE stream. HOLD HALF-PRESS + VARY SCENE.\n");
+    for (int round = 0; round < 3 && n < (int)sizeof(b) - 300; round++)
     {
-        idle_wakeup_reset_counters(-1);   /* best-effort keep-awake */
-        uint32_t ptr = *(volatile uint32_t *)(RAW_LV_CH_BASE + RAW_LV_ADDR_OFF);
-        uint32_t cchk = 0, uchk = 0, ichk = 0;
-        if (ptr >= 0x01000000 && ptr < 0x20000000)
+        idle_wakeup_reset_counters(-1);
+        n += snprintf(b + n, sizeof(b) - n, "--- round %d ---\n", round);
+        for (int i = 0; i < nb && n < (int)sizeof(b) - 80; i++)
         {
-            const volatile uint8_t * pc = (const volatile uint8_t *)CACHEABLE(ptr);
-            const volatile uint8_t * pu = (const volatile uint8_t *)UNCACHEABLE(ptr);
-            for (int i = 0; i < 0x10000; i += 16) cchk = cchk * 31 + pc[i];
-            for (int i = 0; i < 0x10000; i += 16) uchk = uchk * 31 + pu[i];
-            /* invalidate this region's d-cache lines (no writeback), then re-read cached = fresh from RAM */
-            uint32_t a0 = (uint32_t)CACHEABLE(ptr) & ~0x1fu;
-            for (uint32_t a = a0; a < a0 + 0x10000; a += 0x20)
-                asm volatile ("mcr p15, 0, %0, c7, c6, 1" :: "r"(a));
-            asm volatile ("dsb");
-            for (int i = 0; i < 0x10000; i += 16) ichk = ichk * 31 + pc[i];
+            /* flush BEFORE the (possibly faulting) register read so a crash pinpoints the channel */
+            FILE * ff = FIO_CreateFile("ML/LOGS/RAWBR.TXT");
+            if (ff) { FIO_WriteFile(ff, b, n); FIO_CloseFile(ff); }
+            uint32_t ptr = *(volatile uint32_t *)(blk[i] + 0x50);
+            uint32_t kA = 0, kB = 0; int valid = 0;
+            if (ptr >= 0x01000000 && ptr < 0x20000000)
+            {
+                valid = 1;
+                const volatile uint8_t * pu = (const volatile uint8_t *)UNCACHEABLE(ptr);
+                for (int j = 0; j < 0x8000; j += 16) kA = kA * 31 + pu[j];
+                msleep(40);   /* let a frame pass */
+                for (int j = 0; j < 0x8000; j += 16) kB = kB * 31 + pu[j];
+            }
+            n += snprintf(b + n, sizeof(b) - n, "%08x ptr=%08x kA=%08x kB=%08x CHG=%c\n",
+                (unsigned)blk[i], (unsigned)ptr, (unsigned)kA, (unsigned)kB,
+                (valid && kA != kB) ? 'Y' : 'N');
         }
-        n += snprintf(b + n, sizeof(b) - n, "t=%d ptr=%08x cchk=%08x uchk=%08x ichk=%08x\n",
-            t, (unsigned)ptr, (unsigned)cchk, (unsigned)uchk, (unsigned)ichk);
-        if ((t & 3) == 0)
-        {
-            FILE * f = FIO_CreateFile("ML/LOGS/RAWBR.TXT");
-            if (f) { FIO_WriteFile(f, b, n); FIO_CloseFile(f); }
-        }
-        msleep(150);
     }
     FILE * f = FIO_CreateFile("ML/LOGS/RAWBR.TXT");
     if (f) { FIO_WriteFile(f, b, n); FIO_CloseFile(f); }
-    NotifyBox(5000, "live-raw diag done -> RAWBR.TXT");
+    NotifyBox(5000, "Breadth scan done -> RAWBR.TXT");
 }
 #endif
 
@@ -2139,8 +2145,8 @@ static struct menu_entry debug_menus[] = {
         .name        = "Raw bright test",
         .priv        = raw_bright_task,
         .select      = run_in_separate_task,
-        .help  = "IN LIVEVIEW: avg+chksum the P14 raw buffer 80s. LET SCREEN SLEEP halfway.",
-        .help2 = "Tests if raw DMA survives screen-off (overnight timelapse). -> ML/LOGS/RAWBR.TXT.",
+        .help  = "IN LIVEVIEW: breadth-scan write channels for the LIVE one. HOLD HALF-PRESS, VARY SCENE.",
+        .help2 = "Flags the channel whose buffer changes frame-to-frame (CHG=Y). -> ML/LOGS/RAWBR.TXT.",
     },
 #endif
     MENU_PLACEHOLDER("Free Memory"),
