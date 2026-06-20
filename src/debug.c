@@ -1987,9 +1987,7 @@ static void raw_catch_task(void)
  * on one of these.  Per round (1/s) we read +0xa0 (safe), checksum 1KB of the pointed buffer, and log
  * channels whose content CHANGES (= live).  The first few active+changing channels are snapshotted to
  * RAM (2MB) mid-window and written AFTER you stop (no SD writes during recording).  -> RW*.BIN + RECWIN.TXT.
- * ALSO: once idx4 & idx5 (previews DOWNSTREAM of idx23) are active for 5 stable rounds, the 14-bit RAW
- * channel idx23 (0xD0487000) is guaranteed powered, so we read it SAFELY and grab a 4MB frame -> RW487.BIN.
- * Boot-safe (menu task); the only idx23 read is gated on that safe downstream-activity proxy. */
+ * Fully boot-safe (menu task) and run-safe (no faulting reads). */
 static void raw_recwin_task(void)
 {
     gui_stop_menu();
@@ -2005,23 +2003,17 @@ static void raw_recwin_task(void)
     for (int i = 0; i < 16; i++) { prevchk[i] = 0; cap[i] = 0; capsz[i] = 0; }
     static char lg[6500]; int n = 0;
     int total_cap = 0;
-    int rec_streak = 0;      /* consecutive rounds with idx4 & idx5 active = stable recording */
-    void * cap23 = 0;        /* the gated idx23 (14-bit raw) capture */
-    n += snprintf(lg + n, sizeof(lg) - n, "REC-WINDOW sampler: SAFE wide chans + gated idx23 raw, while recording.\n");
+    n += snprintf(lg + n, sizeof(lg) - n, "REC-WINDOW sampler: SAFE wide chans sampled while recording.\n");
     NotifyBox(8000, "REC WINDOW: START RECORDING now -- sampling 25s");
     beep();
     for (int round = 0; round < 25 && n < (int)sizeof(lg) - 300; round++)
     {
-        int idx4_ok = 0, idx5_ok = 0;   /* idx4/idx5 = previews downstream of idx23; active => idx23 powered */
         for (int i = 0; i < NCH; i++)
         {
             uint32_t a0 = *(volatile uint32_t *)(ch[i] + 0xa0u);   /* SAFE channel -- never faults */
             uint32_t cp = a0 & ~0x40000000u;
-            int valid = (cp >= 0x01000000u && cp < 0x60000000u);
-            if (i == 3) idx4_ok = valid;   /* 0xD0420300 */
-            if (i == 4) idx5_ok = valid;   /* 0xD0420400 */
             uint32_t chk = 0;
-            if (valid)
+            if (cp >= 0x01000000u && cp < 0x60000000u)
             {
                 const volatile uint32_t * p = (const volatile uint32_t *)UNCACHEABLE(cp);
                 for (int w = 0; w < 256; w++) chk += p[w];   /* cheap 1KB content checksum */
@@ -2041,23 +2033,6 @@ static void raw_recwin_task(void)
             }
             prevchk[i] = chk;
         }
-        /* SAFE recording detector: idx4 & idx5 (8-bit previews DOWNSTREAM of idx23) both active means
-         * idx23 has produced raw => it is powered => reading it is safe. Require 5 stable rounds so we're
-         * solidly mid-recording (away from the start/stop edges), then read idx23 ONCE and grab the raw. */
-        if (idx4_ok && idx5_ok) rec_streak++; else rec_streak = 0;
-        if (rec_streak >= 5 && !cap23)
-        {
-            uint32_t a23 = *(volatile uint32_t *)(0xD0487000u + 0xa0u);   /* safe now: idx23 powered */
-            uint32_t c23 = a23 & ~0x40000000u;
-            n += snprintf(lg + n, sizeof(lg) - n, "r%d IDX23 0xD0487000 a0=%08x 50=%08x 54=%08x d0=%08x <RAW>\n",
-                round, (unsigned)a23, (unsigned)*(volatile uint32_t *)(0xD0487000u + 0x50u),
-                (unsigned)*(volatile uint32_t *)(0xD0487000u + 0x54u), (unsigned)*(volatile uint32_t *)(0xD0487000u + 0xd0u));
-            if (c23 >= 0x01000000u && c23 < 0x60000000u)
-            {
-                cap23 = fio_malloc(0x400000u);   /* 4MB -- a full raw frame */
-                if (cap23) memcpy(cap23, (void *)UNCACHEABLE(c23 & ~0x000FFFFFu), 0x400000u);
-            }
-        }
         msleep(1000);
     }
     FILE * t = FIO_CreateFile("ML/LOGS/RECWIN.TXT");
@@ -2071,14 +2046,7 @@ static void raw_recwin_task(void)
         if (f) { for (uint32_t off = 0; off < capsz[i]; off += 0x10000u) FIO_WriteFile(f, (uint8_t *)cap[i] + off, 0x10000); FIO_CloseFile(f); dumped++; }
         fio_free(cap[i]);
     }
-    /* the gated idx23 14-bit RAW capture (RW487.BIN) */
-    if (cap23)
-    {
-        FILE * f = FIO_CreateFile("ML/LOGS/RW487.BIN");
-        if (f) { for (uint32_t off = 0; off < 0x400000u; off += 0x10000u) FIO_WriteFile(f, (uint8_t *)cap23 + off, 0x10000); FIO_CloseFile(f); }
-        fio_free(cap23);
-    }
-    NotifyBox(12000, "REC window: %d preview chans + idx23 raw %s -> RW*.BIN", dumped, cap23 ? "GOT" : "(none)");
+    NotifyBox(12000, "REC window: %d chans captured -> RW*.BIN + RECWIN.TXT", dumped);
 }
 #endif
 
@@ -2439,8 +2407,8 @@ static struct menu_entry debug_menus[] = {
         .name        = "Sample raw (REC)",
         .priv        = raw_recwin_task,
         .select      = run_in_separate_task,
-        .help  = "SELECT then RECORD the FULL ~25s: samples safe chans + grabs idx23 14-bit RAW.",
-        .help2 = "idx23 read gated on downstream activity (safe). -> RECWIN.TXT + RW*.BIN + RW487.BIN (raw).",
+        .help  = "SELECT then RECORD ~25s: samples the SAFE wide channels (idx1-8/14/17/18).",
+        .help2 = "Safe (no faulting reads). Logs live channels -> RECWIN.TXT, snapshots -> RW*.BIN.",
     },
 #endif
     MENU_PLACEHOLDER("Free Memory"),
