@@ -1717,14 +1717,21 @@ static void slurp_raw_task(void)
     ei[0x10] = pitch;     /* xb = bytes/row */
     ei[0x13] = H - 1;     /* yb = height-1 (xn=yn=0 -> single contiguous block, skips asserts) */
 
-    NotifyBox(15000, "SLURP idx7<-conn0 -- press REC + RECORD now (~10s)!");
+    NotifyBox(15000, "SLURP idx7<-conn0 -- press REC + RECORD now (staged ~12s)!");
     beep();
-    msleep(6000);         /* let recording stabilise so the sensor raw source is hot */
+    msleep(5000);         /* let recording stabilise so the sensor raw source is hot */
 
-    r_setbuf(chan, ubuf);          /* +0xa0 = our buffer */
-    r_setedmac(chan, 0, 0, ei);    /* geometry */
-    r_connw(chan, conn);           /* connect to sensor raw source */
-    r_start(chan);                 /* start the DMA */
+    /* STAGED: write a marker (truncating) BEFORE each EDMAC op + NotifyBox, so if Err 70 aborts we know
+     * exactly which op disrupted Canon. (setbuf is proven-safe -- the hook did it 12k times.) */
+#define SLURP_MARK(s) do { FILE * sf = FIO_CreateFile("ML/LOGS/SLURP.TXT"); \
+        if (sf) { const char * mm = "last step reached: " s "\n"; FIO_WriteFile(sf, mm, strlen(mm)); FIO_CloseFile(sf); } \
+        NotifyBox(2500, "slurp: " s); beep(); msleep(1500); } while (0)
+    SLURP_MARK("setbuf");   r_setbuf(chan, ubuf);          /* +0xa0 = our buffer */
+    SLURP_MARK("setedmac"); r_setedmac(chan, 0, 0, ei);    /* geometry */
+    SLURP_MARK("connw");    r_connw(chan, conn);           /* connect to sensor raw source */
+    SLURP_MARK("start");    r_start(chan);                 /* start the DMA */
+    SLURP_MARK("ran-ok");                                  /* all 4 ops completed -> capture below */
+#undef SLURP_MARK
     msleep(400);                   /* ~12 frames */
     r_stop(chan);
     msleep(50);

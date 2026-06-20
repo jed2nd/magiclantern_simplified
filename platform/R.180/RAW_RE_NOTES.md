@@ -162,3 +162,14 @@ xn=yn=xs=ys=0 the top asserts (0x4d1/0x4d5) are skipped → a single contiguous 
 SetEDmac(7,0,0,ei) → ConnectWriteEDmac(7,0) → StartEDmac(7) → wait 400ms → stop(+0xb4=0) → copy
 ubuf→SLURP.BIN (ubuf = buf|0x40000000 uncacheable). Logs idx7 regs → SLURP.TXT. EXPERIMENTAL — iterate
 chan/conn/geometry. NEXT: user records + runs it; render SLURP.BIN 14-bit at width 1920 + Bayer test.
+
+### Slurp attempt #1 result: Err 70 (Canon recording malfunction)
+First "Slurp raw" (idx7, conn0, 1920x1080 guess) -> **Err 70 ~4-5s into recording**, right when the EDMAC
+setup runs. So the one-shot slurp setup DISRUPTS Canon's H264 recording. Err 70 is recoverable (not a
+brick). Unknown which op (setbuf/setedmac/connw/start) is the culprit. setbuf (FUN_e05364b6 +0xa0) is
+proven-safe (the hook did it 12k times) -> suspect connw (re-routes the Boomer to conn 0, which Canon is
+actively using) or start (conflicting transfer), or a geometry mismatch (qemu asserts geom==transfer size;
+our 1920x1080 is a guess). NEXT (md5 920afc3c): STAGED slurp -- writes "last step reached: X" to SLURP.TXT
+(truncating) + NotifyBox before each op, so the card pinpoints the disrupting step even if Err 70 aborts.
+Likely real fix = the mlv_lite way: frame-SYNCED slurp via an LV vsync hook (raw_lv_vsync), not a one-shot
+mid-frame setup; and/or ML's own raw LV (not during Canon H264). Iterating.
