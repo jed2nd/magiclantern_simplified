@@ -1814,6 +1814,33 @@ static void raw_bright_task(void)
     if (f) { FIO_WriteFile(f, b, n); FIO_CloseFile(f); }
     NotifyBox(5000, "Breadth scan done -> RAWBR.TXT");
 }
+
+/* ---- DUMP the P14 buffer to the card, so we can prove it's a real image (and read off geometry).
+ * Works on the STATIC post-capture buffer (sidesteps the LV-sleep problem): TAKE A PHOTO first, then
+ * run this. Reads the live ptr at P14 +0x50, dumps 4MB from there (uncached) to ML/LOGS/RAW.BIN.
+ * Analyse on the PC: try widths as 14-bit packed Bayer; a coherent image = proof + the true width. */
+static void raw_dump_task(void)
+{
+    gui_stop_menu();
+    msleep(300);
+    uint32_t ptr = *(volatile uint32_t *)(0xD0440000u + 0x50u);   /* P14 buffer pointer */
+    if (ptr < 0x01000000 || ptr >= 0x20000000)
+    {
+        NotifyBox(6000, "Raw dump: bad ptr %08x (take a photo first?)", (unsigned)ptr);
+        return;
+    }
+    const uint8_t * src = (const uint8_t *)UNCACHEABLE(ptr);
+    FILE * f = FIO_CreateFile("ML/LOGS/RAW.BIN");
+    if (!f) { NotifyBox(6000, "Raw dump: cannot create RAW.BIN"); return; }
+    uint32_t total = 0x400000;   /* 4 MB */
+    for (uint32_t off = 0; off < total; off += 0x10000)
+        FIO_WriteFile(f, src + off, 0x10000);
+    FIO_CloseFile(f);
+    /* a tiny TXT note alongside, recording the source pointer */
+    FILE * t = FIO_CreateFile("ML/LOGS/RAW.TXT");
+    if (t) { char m[80]; int k = snprintf(m, sizeof(m), "RAW.BIN = 4MB from P14 buf %08x (uncached)\n", (unsigned)ptr); FIO_WriteFile(t, m, k); FIO_CloseFile(t); }
+    NotifyBox(8000, "Dumped 4MB from %08x -> RAW.BIN", (unsigned)ptr);
+}
 #endif
 
 #ifdef FEATURE_DEBUG_PROP_DISPLAY
@@ -2147,6 +2174,13 @@ static struct menu_entry debug_menus[] = {
         .select      = run_in_separate_task,
         .help  = "IN LIVEVIEW: breadth-scan write channels for the LIVE one. HOLD HALF-PRESS, VARY SCENE.",
         .help2 = "Flags the channel whose buffer changes frame-to-frame (CHG=Y). -> ML/LOGS/RAWBR.TXT.",
+    },
+    {
+        .name        = "Dump raw buf",
+        .priv        = raw_dump_task,
+        .select      = run_in_separate_task,
+        .help  = "TAKE A PHOTO FIRST, then dump 4MB of the P14 buffer to prove it's an image.",
+        .help2 = "For PC analysis (find width, render). -> ML/LOGS/RAW.BIN (+ RAW.TXT).",
     },
 #endif
     MENU_PLACEHOLDER("Free Memory"),
