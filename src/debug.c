@@ -1892,6 +1892,11 @@ static void raw_cand_task(void)
     for (int i = 0; i < (int)(sizeof(cand) / sizeof(cand[0])); i++)
     {
         uint32_t ch = cand[i];
+        /* ON-SCREEN crash indicator: survives a hard reboot (the SD markers didn't last time).
+         * If the camera reboots, the LAST i/chan shown here is the faulting channel -- tell me that. */
+        NotifyBox(2000, "Raw cand: i=%d chan %08x ...", i, (unsigned)ch);
+        beep();
+        msleep(900);
         /* crash-bisect marker -- create+close flushes it to SD BEFORE the risky MMIO read */
         FILE * mk = FIO_CreateFile("ML/LOGS/LASTCH.TXT");
         if (mk) { char b[48]; int n = snprintf(b, sizeof(b), "about to read chan %08x (i=%d)\n", (unsigned)ch, i); FIO_WriteFile(mk, b, n); FIO_CloseFile(mk); }
