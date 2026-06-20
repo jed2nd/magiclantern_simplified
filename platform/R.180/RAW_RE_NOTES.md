@@ -329,3 +329,23 @@ Cross-check vs the three classic DIGIC-8 raw traps (all already addressed by our
 3. CORRECT CHANNEL (FE raw before IPP, not display/EVF/DPAF-phase) -- exactly the current hunt: find the
    channel whose buffer is FE Bayer (pre-IPP) vs the debayered IPP previews. idx30 confirmed the scene;
    re-targeted dump {2,30,19,64,69,8} to find the Bayer (likely dual-pixel) one.
+
+## 12. DECISIVE: the full-res RAW is NOT CPU-buffered in LV -> must SLURP conn0 (with CBRs)
+Re-targeted dump {2,30,19,64,69,8} rendered. **idx30 @ width 640 = a CLEAN recognizable KITCHEN scene**
+(wall oven, cabinets, backsplash, reflective counter) -- proves the whole read path works (hook -> a0 ->
+UNCACHEABLE read -> render). BUT it's SMOOTH/debayered (a ~640-wide processed/preview plane), NOT Bayer.
+Across all 11 dumped channels: idx30/69 = small debayered previews (scene, planar ~640, repeated); idx8/55/
+45 = stats/structured (header row + black bands); idx2 = wide but streaks at EVERY interp incl dual-pixel
+de-interleave (line-delay / DPAF-phase / non-raster); idx5/18 = sparse/noise. **NO full-res Bayer raster is
+CPU-readable.**
+
+=> This is EXACTLY why mlv_lite uses CONFIG_EDMAC_RAW_SLURP on newer DIGIC: the full-res sensor raw is NOT
+parked in a readable buffer -- it streams through the EDMAC and must be SLURPED in real time from the sensor
+connection (conn 0). The FUN_e05364b6 +0xa0 hook only ever sees post-processing buffers, so it cannot find
+the raw. CONCLUSION: the readable-buffer approach is exhausted; the path to full-res raw is the EDMAC slurp.
+
+***The slurp, done RIGHT this time*** (the earlier Err70/reboot was the missing completion-IRQ heartbeat,
+per sec 11): RegisterEDmacCompleteCBR + AbortCBR + PopCBR on the chan BEFORE StartEDmac (mlv_lite
+edmac_raw_slurp does this; I omitted it). The completion CBR ALSO gives per-frame timing -> we can re-arm
+from the CBR instead of the EVF vsync hook (which crashes EvfCap on R). NEXT: RE the R's RegisterEDmacComplete
+CBR / EDmac CBR table; build a CBR-driven slurp (conn0, dual-pixel geometry, CBRs registered); menu-invoked.
