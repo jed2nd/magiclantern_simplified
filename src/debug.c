@@ -1676,9 +1676,10 @@ static void rawhk_task(void)
     }
     if (dumpfull)
     {
-        /* dump FULL 4MB buffers of the 14-bit/16-bit raw candidates (distinct a0s) -> ML/LOGS/RWxx.BIN,
-         * for full-frame rendering (128KB top-sliver was inconclusive). Buffers stay live (raw mode on). */
-        static const int cand[] = {2, 45, 55, 5, 18};
+        /* dump FULL 4MB buffers of the scene-showing high-corr + widest channels -> ML/LOGS/RWxx.BIN.
+         * (idx30 showed the actual scene; hunt the one with Bayer mosaic = the raw.) Buffers live (raw on).
+         * a0 comes from the hook ARG (RAM), so faulting-region channels (d04a2: 30/64/69) are fine to read. */
+        static const int cand[] = {2, 30, 19, 64, 69, 8};
         for (unsigned ci = 0; ci < sizeof(cand) / sizeof(cand[0]); ci++)
         {
             int c = cand[ci];
@@ -2586,7 +2587,7 @@ static struct menu_entry debug_menus[] = {
         .priv        = rawlv_dump_task,
         .select      = run_in_separate_task,
         .help  = "In movie LiveView (NO rec): Raw-LV hook + dumps FULL buffers of raw candidates (4MB each).",
-        .help2 = "For full-frame Bayer confirmation. -> ML/LOGS/RW2/45/55/5/18.BIN (~20MB, ~20s).",
+        .help2 = "For full-frame Bayer confirmation. -> ML/LOGS/RW2/30/19/64/69/8.BIN (~24MB, ~20s).",
     },
     {
         .name        = "Slurp raw",

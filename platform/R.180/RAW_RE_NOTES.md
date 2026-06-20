@@ -292,3 +292,18 @@ idx5) -> the coherent Bayer scene = THE RAW + its channel + true geometry.
 NOTE (strategy): for 4K RAW VIDEO the sensor-raw-in-movie-mode IS the source (can't disable the sensor);
 what gets suppressed in real raw recording is the PREVIEW/display (bandwidth), not the sensor. This LV work
 finds the tap point that recording reuses. (Full-res raw STILLS would be a different, higher-res readout.)
+
+### First full dumps (idx2/45/55/5/18) -- inconclusive, but SCENE CONFIRMED in idx30
+Rendered the 5 full 4MB dumps (eosr_port/render_full.py + idx2_sweep.py, multi bit-depth + contrast
+stretch). None was a clean Bayer scene: idx5=mostly black (sparse/stats), idx2(4K)=smooth horizontal
+streaks at ALL bit-depths (8/12/14MSB/14LSB/16), idx45/55=structured (header rows + black bands), idx18=
+noise+brightness step. KEY: the 128KB sliver of **idx30 (d04a2400, stride~1920) shows a RECOGNIZABLE SCENE
+-- a room interior (microwave/appliance, shelves), repeated ~3x so true width ~640.** So (a) the scene had
+plenty of detail, (b) idx2's smoothness = we dumped the WRONG channels. I had picked by 14-bit-stride match,
+but the most image-like channels by row-correlation were idx19/64 (0.99), idx69 (0.97), idx30 (0.93) --
+NONE dumped. Also the widest buffers (idx2 4K = 14.5MB) likely TEAR during the 4MB read-while-writing,
+whereas small buffers (idx30) read stable. RE-TARGETED "Raw-LV dump" -> cand {2,30,19,64,69,8} (md5
+5f902e3c @ 14:40). NOTE: dump reads a0 from the hook ARG (RAM), so faulting-register channels (d04a2:
+30/64/69) ARE dumpable. NEXT: user re-runs in movie LV pointing at the (detailed) scene; render all ->
+the channel showing the scene with Bayer mosaic = THE RAW. (If wide ones still tear, add a per-channel
+freeze: stop +0xb4 on non-faulting candidates before dump.)
