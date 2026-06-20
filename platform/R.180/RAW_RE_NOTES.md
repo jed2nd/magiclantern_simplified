@@ -441,3 +441,23 @@ make *243ec non-null) so Canon programs the full-res raw buffer we CAN read -- t
 camera-free RE of the trigger first. (B) fully initialize a free channel the way Canon does (transfer/ISR/
 Boomer/IRQ) -- very deep. (C) a true raw-LV bring-up. Recommendation: pursue (A) via camera-free RE before
 any more camera tests.
+
+## 17. Dpraw = Canon DUAL PIXEL RAW (a STILLS feature). Video raw = hard limit; stills raw IS reachable.
+DprawSap_Start (FUN_e071f574) builds a "DprawSapCorrection" object + runs the HeadToRaw chain (4 ctx params
+-> upstream-triggered). ROM strings settle what it is: **`CameraConductor::CC_PropLink_DPRAW.c`** (property-
+linked), **`SCS_FaAllocateMemoryResourceForDpRawCaptureBuffer`**, **`FA_GetDPRawBuf`**, **`Set/GetDPRawImage
+Buffer`**, **`Mem1ComponentForDPRaw`**, **`DPRAW_DARK`**. => Dpraw is Canon's **Dual Pixel RAW**, a *stills*
+capture path (a photo, with a dedicated DpRaw capture buffer), NOT a video route. That's why *243ec was NULL
+in plain H264 (the Dpraw config only allocates for a DPRAW photo capture).
+
+CONCLUSION:
+- **VIDEO full-res raw = HARD LIMIT** (confirmed not CPU-readable in LV/recording; slurp unworkable; EVF hook
+  crashes; Dpraw is stills, not video). No accessible path on the R right now. Documented.
+- **STILLS full-res raw = REACHABLE.** Enabling Canon's "Dual Pixel RAW" (a normal Photo menu setting) makes
+  Canon allocate the DpRaw capture buffer + run DprawHeadToRaw, which programs the raw chan via FUN_e05364b6
+  -- the EXACT leaf our +0xa0 hook taps. So the existing "Rec dump" (rawhk +0xa0 hook + full-buffer dump),
+  run while taking a DPRAW PHOTO, should catch Canon's full-res raw buffer -> ML reads the full-res raw
+  (the "ML control: read+save the raw" goal, for stills). No commandeering, no property write -> safe.
+  This is the raw-track camera probe. (Each timelapse frame is already a CR3; this is ML reading the raw
+  buffer directly, toward an ML DNG pipeline.)
+=> Both tracks camera-ready: (A) adaptive timelapse test, (B) Dpraw-stills raw via "Rec dump" + a DPRAW photo.
