@@ -115,10 +115,30 @@ from the function ARG `r1` — so even faulting-region channels are covered). Fi
   pixel-level Bayer test: raw Bayer shows adjacent≫alternate pixel diff).
 
 ---
-## 7. Next: the slurp
+## 7. The slurp — sensor raw source + geometry (CONFIRMED via qemu-eos `engine.c`)
 
-Build an experimental "Slurp raw" task: during recording, `ConnectWriteEDmac(free_chan, conn)` +
-`SetEDmac(free_chan, fio_malloc'd buf, geometry)` + `StartEDmac(free_chan)`, copy the buffer to SD,
-render. Open variables: the sensor-raw **source connection id**, a **free write channel** (one NOT in the
-`FUN_e05364b6` log: idx0,1,3,7,9,10,12,13,15,16,20,22,25,32-38), the **geometry**, and whether a parallel
-connection disrupts Canon. Iterate by camera test until a coherent Bayer frame lands.
+The qemu-eos EDMAC model is explicit about the sensor-raw source connection:
+```c
+/* engine.c, write path (image-processing module -> memory) */
+if (conn == 0 || conn == 35) {            /* sensor data */
+    int raw_width  = xb * 8/14;           /* xb = the SetEDmac byte pitch */
+    int raw_height = yb ? yb + 1 : xn + 1;
+    /* transfer_data_size == raw_width * raw_height * 14/8  -> 14-BIT PACKED */
+    load_fullres_14bit_raw(buf, raw_width, raw_height);
+}
+```
+So **connection 0 (fallback 35) = the sensor 14-bit raw source**, matching mlv_lite's
+`ConnectWriteEDmac(raw_write_chan, 0)`. The slurp recipe for the R:
+```
+ConnectWriteEDmac(free_chan, 0);                         // 0xE053607C ; conn 0 = sensor raw
+SetEDmac(free_chan, OUR_buf, &{ xb = width*14/8, yb = height-1 }, dmaFlags);   // 0xE0536ABC, 14-bit packed
+StartEDmac(free_chan, 0);                                // 0xE053595E ; +0xb4 = 1 (write start)
+```
+`raw_width = xb*8/14`, `raw_height = yb+1`, buffer = `width*height*14/8` bytes. Run while the sensor
+pipeline is hot (recording). ConnectWriteEDmac asserts the channel has a valid BoomerID
+(`DmacBoomerInfo[port].BoomerID != -1`, table ptr `0xE05361F8` stride 0xc) and is a WRITE channel.
+
+Open variables: a **free write channel** with a BoomerID (one NOT in the `FUN_e05364b6` hook log:
+idx0,1,3,7,9,10,12,13,15,16,20,22,25,32-38 — experiment), the actual **width/height**, and whether a
+parallel connection to conn 0 disrupts Canon's recording. Iterate by camera test until a coherent Bayer
+frame lands (pixel-level Bayer test: adjacent-pixel diff >> alternate-pixel diff).
