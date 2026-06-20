@@ -1928,6 +1928,53 @@ static void raw_cand_task(void)
     if (mk) { const char * d = "done -- no fault\n"; FIO_WriteFile(mk, d, strlen(d)); FIO_CloseFile(mk); }
     NotifyBox(10000, "Raw cand probe: %d chans dumped -> RC*.BIN", dumped);
 }
+
+/* ---- RECORD-GATED RAW CATCHER (Debug -> "Catch raw (REC)").  idx23 0xD0487000 is the Mem1/HeadToRaw
+ * raw channel (matches the 200D/6D2 index-23); it FAULTS when idle and powers up only during recording
+ * (confirmed: it faulted in plain Movie LV).  Arm this, then press the camera's REC button: it waits
+ * for RECORDING_H264_STARTED, reads 0xD0487000+0xa0 (now powered), captures the buffer to RAM, and
+ * after you stop recording writes RC487.BIN (+ RC487.TXT geometry) for the PC render. */
+static void raw_catch_task(void)
+{
+    gui_stop_menu();
+    msleep(300);
+    NotifyBox(8000, "Raw catch ARMED -- press REC now (waiting 40s)");
+    beep();
+    int waited = 0;
+    while (!RECORDING_H264_STARTED && waited < 40000) { msleep(100); waited += 100; }
+    if (!RECORDING_H264_STARTED) { NotifyBox(6000, "Raw catch: no recording seen -> abort"); return; }
+    beep();
+    msleep(1500);   /* let the raw pipeline spin up so 0xD0487000 is powered */
+    /* crash-visible: if this read still faults, the camera reboots right here */
+    NotifyBox(3000, "Raw catch: reading 0xD0487000 ...");
+    uint32_t ptr = *(volatile uint32_t *)(0xD0487000u + 0xa0u);
+    uint32_t g50 = *(volatile uint32_t *)(0xD0487000u + 0x50u);
+    uint32_t g54 = *(volatile uint32_t *)(0xD0487000u + 0x54u);
+    uint32_t cp  = ptr & ~0x40000000u;
+    static char info[160];
+    snprintf(info, sizeof(info), "0xD0487000 during REC: a0=%08x 50=%08x 54=%08x\n", (unsigned)ptr, (unsigned)g50, (unsigned)g54);
+    void * cap = 0; uint32_t capsz = 0;
+    if (cp >= 0x01000000u && cp < 0x60000000u)
+    {
+        static const uint32_t sizes[] = {0x400000u, 0x200000u, 0x100000u};
+        for (int s = 0; s < 3 && !cap; s++) { cap = fio_malloc(sizes[s]); if (cap) capsz = sizes[s]; }
+        if (cap) memcpy(cap, (void *)UNCACHEABLE(cp), capsz);
+    }
+    /* wait for recording to stop so the SD is free for our write */
+    int w2 = 0;
+    while (RECORDING_H264 && w2 < 90000) { msleep(200); w2 += 200; }
+    msleep(800);
+    FILE * t = FIO_CreateFile("ML/LOGS/RC487.TXT");
+    if (t) { FIO_WriteFile(t, info, strlen(info)); FIO_CloseFile(t); }
+    if (cap)
+    {
+        FILE * f = FIO_CreateFile("ML/LOGS/RC487.BIN");
+        if (f) { for (uint32_t off = 0; off < capsz; off += 0x10000u) FIO_WriteFile(f, (uint8_t *)cap + off, 0x10000); FIO_CloseFile(f); }
+        fio_free(cap);
+        NotifyBox(12000, "Caught 0xD0487000 %dMB -> RC487.BIN (a0=%08x)", (int)(capsz >> 20), (unsigned)ptr);
+    }
+    else NotifyBox(12000, "0xD0487000 a0=%08x (no buffer captured)", (unsigned)ptr);
+}
 #endif
 
 #ifdef FEATURE_DEBUG_PROP_DISPLAY
@@ -2275,6 +2322,13 @@ static struct menu_entry debug_menus[] = {
         .select      = run_in_separate_task,
         .help  = "IN MOVIE LIVEVIEW: dump the WIDE imaging-write channels (idx17/18/23/24/26-28).",
         .help2 = "Hunts the real Mem1/HeadToRaw channel. -> ML/LOGS/RC*.BIN + RAWCAND.TXT (crash-bisect LASTCH.TXT).",
+    },
+    {
+        .name        = "Catch raw (REC)",
+        .priv        = raw_catch_task,
+        .select      = run_in_separate_task,
+        .help  = "ARM, then press REC: catches the raw channel 0xD0487000 while it's powered.",
+        .help2 = "Captures buffer to RAM during recording, writes RC487.BIN after stop (+ RC487.TXT).",
     },
 #endif
     MENU_PLACEHOLDER("Free Memory"),
