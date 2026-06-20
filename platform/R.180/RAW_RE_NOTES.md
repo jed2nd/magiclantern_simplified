@@ -148,3 +148,17 @@ Remaining open variables: the actual **width/height** (guess a common LV-raw res
 the EOS R 1736-ish; the qemu geometry formula tells us xb/yb), and whether a parallel connection to conn 0
 disrupts Canon's recording (mlv_lite reads conn 0 in parallel, so it should be OK — verify by camera test).
 Iterate channel/conn/geometry until a coherent Bayer frame lands (pixel Bayer test: adjacent >> alternate).
+
+### SetEDmac geometry struct (decompiled `FUN_e0536abc`) + the slurp build
+`SetEDmac(port, addr, b14, edmac_info* ei)` writes geometry from `ei` (a uint array). Mapping:
+`+0x48 ys_xs = ei[0xe]|ei[0x11]<<16`, `+0x4c ya_xa = ei[0xf]|ei[0x12]<<16`,
+`+0x50 yb_xb = ei[0x10]|ei[0x13]<<16`, `+0x54 yn_xn = ei[0x14]|ei[0x15]<<16`.
+=> **xb=ei[0x10], yb=ei[0x13], xn=ei[0x14], yn=ei[0x15]** (xs/xa/ys/ya at 0xe/0xf/0x11/0x12). With
+xn=yn=xs=ys=0 the top asserts (0x4d1/0x4d5) are skipped → a single contiguous block of xb bytes ×
+(yb+1) rows. addr→+0xa4, b14→+0xa8 (the BUFFER is +0xa0, set separately by FUN_e05364b6).
+
+**"Slurp raw" task built (debug.c, md5 03f0ef1b @ 12:29):** chan idx7, conn 0, 1920×1080 guess
+(pitch=W*14/8=3360, ei[0x10]=3360, ei[0x13]=1079). Seq during recording: FUN_e05364b6(7, ubuf) →
+SetEDmac(7,0,0,ei) → ConnectWriteEDmac(7,0) → StartEDmac(7) → wait 400ms → stop(+0xb4=0) → copy
+ubuf→SLURP.BIN (ubuf = buf|0x40000000 uncacheable). Logs idx7 regs → SLURP.TXT. EXPERIMENTAL — iterate
+chan/conn/geometry. NEXT: user records + runs it; render SLURP.BIN 14-bit at width 1920 + Bayer test.

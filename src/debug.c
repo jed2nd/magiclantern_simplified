@@ -1685,6 +1685,68 @@ static void rawhk_task(void)
     NotifyBox(9000, "raw hook: %d calls -> RAWHK.TXT", (int)rawhk_total);
 }
 
+/* ---- EXPERIMENTAL SLURP (Debug -> "Slurp raw").  Pull the sensor 14-bit raw into OUR buffer the
+ * mlv_lite way: commandeer a FREE write EDMAC channel and connect it to the sensor raw SOURCE
+ * (connection 0 -- qemu-eos engine.c: conn 0/35 = sensor 14-bit raw; raw_width=xb*8/14, raw_height=yb+1,
+ * 14-bit packed). Sequence (R EDMAC API): set buffer (+0xa0 via FUN_e05364b6 0xE05364B6); SetEDmac
+ * geometry (0xE0536ABC, port,addr,b14,edmac_info*; xb=ei[0x10], yb=ei[0x13], xn=yn=0 single block);
+ * ConnectWriteEDmac(chan,0) (0xE053607C); StartEDmac (0xE053595E, +0xb4=1); wait during recording; stop
+ * (0xE0536142, +0xb4=0); copy. chan/conn/geometry are EXPERIMENTAL -> iterate. Menu-invoked (recoverable).
+ * -> ML/LOGS/SLURP.BIN + SLURP.TXT. */
+static void slurp_raw_task(void)
+{
+    gui_stop_menu();
+    msleep(300);
+    void (*r_setbuf)(uint32_t, uint32_t)                        = (void *)(0xE05364B6u | 1);
+    void (*r_setedmac)(uint32_t, uint32_t, uint32_t, uint32_t *) = (void *)(0xE0536ABCu | 1);
+    void (*r_connw)(uint32_t, uint32_t)                         = (void *)(0xE053607Cu | 1);
+    void (*r_start)(uint32_t)                                   = (void *)(0xE053595Eu | 1);
+    void (*r_stop)(uint32_t)                                    = (void *)(0xE0536142u | 1);
+
+    const uint32_t chan = 7, conn = 0;            /* idx7 = free write chan; conn 0 = sensor raw */
+    const uint32_t W = 1920, H = 1080;
+    uint32_t pitch = W * 14u / 8u;                /* 14-bit packed bytes/row */
+    uint32_t sz = pitch * H;
+    void * buf = fio_malloc(sz);
+    if (!buf) { NotifyBox(6000, "slurp: fio_malloc %d failed", (int)sz); return; }
+    uint32_t ubuf = (uint32_t)buf | 0x40000000u;   /* R uncacheable alias (mem_defs UNCACHEABLE) */
+    memset((void *)ubuf, 0, sz);
+
+    static uint32_t ei[0x16];
+    for (int i = 0; i < 0x16; i++) ei[i] = 0;
+    ei[0x10] = pitch;     /* xb = bytes/row */
+    ei[0x13] = H - 1;     /* yb = height-1 (xn=yn=0 -> single contiguous block, skips asserts) */
+
+    NotifyBox(15000, "SLURP idx7<-conn0 -- press REC + RECORD now (~10s)!");
+    beep();
+    msleep(6000);         /* let recording stabilise so the sensor raw source is hot */
+
+    r_setbuf(chan, ubuf);          /* +0xa0 = our buffer */
+    r_setedmac(chan, 0, 0, ei);    /* geometry */
+    r_connw(chan, conn);           /* connect to sensor raw source */
+    r_start(chan);                 /* start the DMA */
+    msleep(400);                   /* ~12 frames */
+    r_stop(chan);
+    msleep(50);
+
+    uint32_t pblock = *(volatile uint32_t *)(0xE0DD5C64u + chan * 8);
+    static char t[320]; int n = 0;
+    n += snprintf(t + n, sizeof(t) - n, "slurp idx%d conn%d %dx%d pitch%d sz%d pblock=%08x\nregs:",
+                  (int)chan, (int)conn, (int)W, (int)H, (int)pitch, (int)sz, (unsigned)pblock);
+    for (uint32_t off = 0x48; off <= 0x58; off += 4)
+        n += snprintf(t + n, sizeof(t) - n, " %x=%08x", (unsigned)off, (unsigned)*(volatile uint32_t *)(pblock + off));
+    n += snprintf(t + n, sizeof(t) - n, " a0=%08x b4=%08x buf=%08x\n",
+                  (unsigned)*(volatile uint32_t *)(pblock + 0xa0u), (unsigned)*(volatile uint32_t *)(pblock + 0xb4u), (unsigned)ubuf);
+    FILE * tf = FIO_CreateFile("ML/LOGS/SLURP.TXT");
+    if (tf) { FIO_WriteFile(tf, t, n); FIO_CloseFile(tf); }
+
+    FILE * f = FIO_CreateFile("ML/LOGS/SLURP.BIN");
+    if (f) { for (uint32_t o = 0; o < sz; o += 0x10000u) { uint32_t cs = sz - o < 0x10000u ? sz - o : 0x10000u; FIO_WriteFile(f, (uint8_t *)ubuf + o, cs); } FIO_CloseFile(f); }
+    fio_free(buf);
+    msleep(1500);
+    NotifyBox(12000, "slurp idx7 done -> SLURP.BIN (stop recording)");
+}
+
 /* ---- RAW BRIGHTNESS + SCREEN-SLEEP TEST (Debug -> "Raw bright test").
  * We found the LV raw write channel: DmacInfo Port 14 = pBlock 0xD0440000, buffer-pointer reg at
  * +0x50, content = uncompressed Bayer. This averages that buffer over ~80s while logging a checksum,
@@ -2308,6 +2370,13 @@ static struct menu_entry debug_menus[] = {
         .select      = run_in_separate_task,
         .help  = "Select, then press REC + RECORD 12s: hooks FUN_e05364b6 (the +0xa0 buffer setter).",
         .help2 = "Logs which chan gets the raw buffer (idx+a0). Auto-unpatch. -> ML/LOGS/RAWHK.TXT.",
+    },
+    {
+        .name        = "Slurp raw",
+        .priv        = slurp_raw_task,
+        .select      = run_in_separate_task,
+        .help  = "Select, then press REC + RECORD ~10s: slurp idx7<-sensor-raw(conn0) into our buffer.",
+        .help2 = "Experimental mlv_lite-style raw capture. -> ML/LOGS/SLURP.BIN (+SLURP.TXT regs).",
     },
     {
         .name        = "Raw bright test",
