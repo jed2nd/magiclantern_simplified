@@ -253,3 +253,20 @@ each frame fires 4 inputs (3,4,5,6), all old=5->new=5, each 120x over 4s = **30f
 evfReadOutDoneInterrupt** (matches ML's DIGIC-V CONFIG_EVF_STATE_SYNC convention). => SS_IN=5/SS_OLD=5
 (already the placeholder) is correct for the frame-synced slurp. Fallbacks if 5 doesn't yield raw: 6, 4, 3.
 => Deploying "Sync slurp" with the EVF spy arming at (input 5, old 5).
+
+## 9. PIVOT: EVF hook is a known crash; use Canon's raw-LV eventprocs instead
+"Sync slurp" (EVF spy arming the slurp at readout input5) -> **Err 70 + REBOOT**. Two findings:
+1. **internals.h:29-30: `/* hooking EVF_STATE ends with EvfCap crashes, requires investigation */
+   //#define CONFIG_STATE_OBJECT_HOOKS`** -- the R porter ALREADY found hooking EVF_STATE crashes (EvfCap).
+   That IS our reboot. => the EVF-hook / CONFIG_EVF_STATE_SYNC frame-synced-slurp path is a DEAD END on R.
+2. Err 70 at StartEDmac is NOT timing -- it's that the LV pipeline wasn't in RAW mode, so conn0 carried
+   processed/YUV and a 2nd writer conflicted. **On D8, raw LV must be ENABLED via Canon eventprocs**
+   (raw.c raw_lv_enable): `call("lv_set_mm", 1)` (D8: select RAW; lv_save_raw is YUV by default) +
+   `call("lv_save_raw", 1)`. CONFIG_DIGIC_VIII is set for the R; the working D8 ports (M50/850D/M6II) use this.
+
+**New approach "Raw-LV hook" (rawlv_hook_task, md5 c53d5860 @ 13:26):** the SAFE raw-buffer finder. In movie
+LiveView (NO record): apply the proven +0xa0 hook (FUN_e05364b6), THEN call lv_set_mm(1)+lv_save_raw(1) to
+make Canon output raw, log/snapshot which channel now gets the raw buffer (10s), then lv_save_raw(0) +
+unpatch. No EVF hook (no EvfCap crash), no channel commandeer (no Err70) -- just enable Canon's own raw +
+read the buffer it programs. -> ML/LOGS/RAWHK.TXT + RAWHKB.BIN. NEXT: user runs it in movie LV; render the
+snapshot -> the channel whose buffer is now Bayer (vs the debayered ones seen without raw mode) = the RAW.

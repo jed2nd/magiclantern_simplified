@@ -1602,10 +1602,15 @@ void rawhk_wrapper(uint32_t chan, uint32_t addr)
     *(volatile uint32_t *)(pblock + 0xa0) = addr;             /* replicate FUN_e05364b6 */
 }
 
+/* set by the "Raw-LV hook" wrapper: enable Canon's raw LV (lv_set_mm/lv_save_raw) before hooking, so the
+ * +0xa0 hook captures the channel Canon programs with the 14-bit RAW buffer (no EVF hook, no commandeering). */
+static int rawhk_rawlv = 0;
 static void rawhk_task(void)
 {
     gui_stop_menu();
     msleep(500);
+    int rawlv = rawhk_rawlv; rawhk_rawlv = 0;
+    if (rawlv && !lv) { NotifyBox(5000, "Raw-LV hook: enter LiveView first"); return; }
     for (int i = 0; i < RAWHK_NCH; i++) { rawhk_addr[i] = 0; rawhk_hits[i] = 0; }
     rawhk_on = 0; rawhk_total = 0;
 
@@ -1632,10 +1637,20 @@ static void rawhk_task(void)
     }
     uint32_t patched = *(volatile uint32_t *)0xE05364B6;   /* should read back f000f8df (ldr.w pc,[pc]) */
 
+    if (rawlv)
+    {
+        /* enable Canon's raw LV AFTER the hook is live so we catch the raw buffer being programmed.
+         * On D8 lv_save_raw outputs YUV by default; lv_set_mm(1) selects RAW (raw.c raw_lv_enable). */
+        call("lv_set_mm", 1);
+        call("lv_save_raw", 1);
+        msleep(700);
+    }
+
     rawhk_on = 1;
-    NotifyBox(13000, "RAW HOOK ARMED -- press REC and RECORD now (12s)!");
+    NotifyBox(13000, rawlv ? "RAW-LV HOOK ARMED -- hold still in LiveView (10s)"
+                           : "RAW HOOK ARMED -- press REC and RECORD now (12s)!");
     beep();
-    msleep(7000);   /* let every channel populate + recording stabilise */
+    msleep(7000);   /* let every channel populate (raw LV or recording) */
     /* SNAPSHOT while recording (buffers fresh): the hook captured each channel's buffer addr via the
      * function ARG (r1) -- those are RAM addresses, readable even for the faulting-region channels whose
      * REGISTERS we can't read. Copy 128KB of each logged channel's buffer into one RAM blob (header per
@@ -1661,6 +1676,7 @@ static void rawhk_task(void)
     rawhk_on = 0;
     msleep(50);
     unpatch_memory(0xE05364B6);
+    if (rawlv) { call("lv_save_raw", 0); }   /* restore: stop Canon raw LV output */
     if (blob)
     {
         FILE * bf = FIO_CreateFile("ML/LOGS/RAWHKB.BIN");
@@ -1686,6 +1702,10 @@ static void rawhk_task(void)
     if (f) { FIO_WriteFile(f, b, n); FIO_CloseFile(f); }
     NotifyBox(9000, "raw hook: %d calls -> RAWHK.TXT", (int)rawhk_total);
 }
+
+/* "Raw-LV hook": enable Canon raw LV (lv_set_mm/lv_save_raw) then run the +0xa0 hook in plain LiveView --
+ * the safe way to find the 14-bit RAW buffer (no EVF hook = no EvfCap crash; no channel commandeer = no Err70). */
+static void rawlv_hook_task(void) { rawhk_rawlv = 1; rawhk_task(); }
 
 /* ---- EXPERIMENTAL SLURP (Debug -> "Slurp raw").  Pull the sensor 14-bit raw into OUR buffer the
  * mlv_lite way: commandeer a FREE write EDMAC channel and connect it to the sensor raw SOURCE
@@ -2531,6 +2551,13 @@ static struct menu_entry debug_menus[] = {
         .select      = run_in_separate_task,
         .help  = "Select, then press REC + RECORD 12s: hooks FUN_e05364b6 (the +0xa0 buffer setter).",
         .help2 = "Logs which chan gets the raw buffer (idx+a0). Auto-unpatch. -> ML/LOGS/RAWHK.TXT.",
+    },
+    {
+        .name        = "Raw-LV hook",
+        .priv        = rawlv_hook_task,
+        .select      = run_in_separate_task,
+        .help  = "In movie LiveView (NO rec): enables Canon raw LV (lv_set_mm+lv_save_raw) then +0xa0 hooks.",
+        .help2 = "Safe raw-buffer finder (no EVF hook/no commandeer). -> ML/LOGS/RAWHK.TXT + RAWHKB.BIN.",
     },
     {
         .name        = "Slurp raw",
