@@ -1709,6 +1709,9 @@ static void rawhk_task(void)
         "raw +0xa0 hook: total=%d  entry=%08x (hook ok if f000f8df)\n"
         "idx pblock hits a0 -- the RAW chan = a big rotating a0 (~0x4xxxxxxx) set every frame.\n",
         (int)rawhk_total, (unsigned)patched);
+    /* DprawHeadToRaw config (sec 3): DAT_e06d6c48=0x243ec; the raw chan idx = *(0x243ec+0x34)=*(0x24420) */
+    n += snprintf(b + n, sizeof(b) - n, "dpraw: *243ec=%08x *24420=%08x (raw chan hint)\n",
+                  (unsigned)(*(volatile uint32_t *)0x000243ecu), (unsigned)(*(volatile uint32_t *)0x00024420u));
     uint32_t base = *(volatile uint32_t *)0xE0536D58;
     for (int c = 0; c < RAWHK_NCH && n < (int)sizeof(b) - 80; c++)
     {
@@ -1729,6 +1732,11 @@ static void rawlv_hook_task(void) { rawhk_rawlv = 1; rawhk_task(); }
 /* "Raw-LV dump": like Raw-LV hook, but also dumps the FULL 4MB buffer of each 14/16-bit raw candidate
  * (idx 2,45,55,5,18) -> ML/LOGS/RWxx.BIN, to render full frames and confirm which is the Bayer raw. */
 static void rawlv_dump_task(void) { rawhk_rawlv = 1; rawhk_dumpfull = 1; rawhk_task(); }
+
+/* "Rec dump": the +0xa0 hook + FULL-buffer dump during H264 RECORDING (rawlv=0), to catch Canon's own
+ * Dpraw (Dual Pixel RAW) full-res buffer programmed via FUN_e05364b6 on the record path -- no channel
+ * commandeering, no StartEDmac (which hangs), so it can't lock up. -> RAWHK.TXT (+ dpraw chan hint) + RWxx.BIN. */
+static void rec_dump_task(void) { rawhk_dumpfull = 1; rawhk_task(); }
 
 /* ---- EXPERIMENTAL SLURP (Debug -> "Slurp raw").  Pull the sensor 14-bit raw into OUR buffer the
  * mlv_lite way: commandeer a FREE write EDMAC channel and connect it to the sensor raw SOURCE
@@ -2669,6 +2677,13 @@ static struct menu_entry debug_menus[] = {
         .select      = run_in_separate_task,
         .help  = "In movie LiveView (NO rec): Raw-LV hook + dumps FULL buffers of raw candidates (4MB each).",
         .help2 = "For full-frame Bayer confirmation. -> ML/LOGS/RW2/30/19/64/69/8.BIN (~24MB, ~20s).",
+    },
+    {
+        .name        = "Rec dump",
+        .priv        = rec_dump_task,
+        .select      = run_in_separate_task,
+        .help  = "Select, then press REC + RECORD ~12s: hook + dump full buffers during H264 (Dpraw path).",
+        .help2 = "Reads Canon's own raw (no commandeer/StartEDmac=no hang). -> RAWHK.TXT + RWxx.BIN.",
     },
     {
         .name        = "Slurp raw",

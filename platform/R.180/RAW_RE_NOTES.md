@@ -403,3 +403,21 @@ and our menu task runs on core B, RegisterEDmacCompleteCBR -> -1 -> **panic**. T
 i.e. replicate FUN_e0535a82's table writes WITHOUT its FUN_e0554504 call. (If staged shows start/waiting
 instead, the panic is the transfer/ISR on a commandeered free chan -> pivot to a different chan/conn or
 Canon's raw-channel infra, not this fix.)
+
+## 15. PROVEN BLOCKER: commandeered-free-channel slurp is unworkable. Pivot to Canon's own raw channel.
+Staged CBR slurp -> last marker "start" then HARD HANG (no reboot, battery pull; no Err70). So regcomplete/
+connw/setbuf/setedmac all PASS; **StartEDmac is the wall**. Combined with the bare slurp (Err70 at start),
+this proves: starting a commandeered FREE channel (idx7) on a sensor-raw connection is rejected -- bare ->
+engine Err70; +completion CBR -> the completion IRQ fires into idx7's unprepared ISR path -> hard lock.
+Free channels lack the transfer/ISR infra Canon sets up only for channels it actively uses. The SMP
+re-register theory was wrong (regcomplete passed). ==> ABANDON the commandeer-a-free-channel slurp.
+
+PIVOT (md5 fff5d8c5 @ 15:48): "Rec dump" (rec_dump_task) -- the proven +0xa0 hook + FULL 4MB buffer dump
+of the candidates DURING H264 RECORDING (rawlv=0). The Dpraw (Dual Pixel RAW) record path (sec 3: record
+evt -> DprawHeadToRaw -> FUN_e06d6bda programs the raw chan via FUN_e05364b6) should program Canon's own
+full-res raw buffer, which our hook catches -- NO commandeering, NO StartEDmac, so it CANNOT hang. Also logs
+the dpraw chan hint *(0x243ec)/*(0x24420). -> RAWHK.TXT + RW{2,30,19,64,69,8}.BIN. NEXT: user records ~12s;
+render the dumps (render_full/render_dpraw) -> if Canon's recording raw is full-res Bayer, we read it
+straight (then continuous capture from that channel). If still only previews: the full-res raw truly never
+hits a CPU buffer (recording or LV) on this body -> document as the hard limit; the only remaining path is a
+properly Canon-initialized channel/raw-LV-mode, which is a deep bring-up.
