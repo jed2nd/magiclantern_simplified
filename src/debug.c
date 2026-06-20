@@ -1940,9 +1940,12 @@ static void raw_catch_task(void)
     msleep(300);
     NotifyBox(8000, "Raw catch ARMED -- press REC now (waiting 40s)");
     beep();
+    /* gate on RECORDING_H264 (__recording>0) so we catch either "starting"(1) or "recording"(2);
+     * the spin-up delay below then ensures the raw pipeline is fully live. Requires PROP_MVR_REC_START
+     * to be allowed (un-denied in property_whitelist.h). */
     int waited = 0;
-    while (!RECORDING_H264_STARTED && waited < 40000) { msleep(100); waited += 100; }
-    if (!RECORDING_H264_STARTED) { NotifyBox(6000, "Raw catch: no recording seen -> abort"); return; }
+    while (!RECORDING_H264 && waited < 40000) { msleep(100); waited += 100; }
+    if (!RECORDING_H264) { NotifyBox(6000, "Raw catch: no recording seen -> abort"); return; }
     beep();
     msleep(1500);   /* let the raw pipeline spin up so 0xD0487000 is powered */
     /* crash-visible: if this read still faults, the camera reboots right here */

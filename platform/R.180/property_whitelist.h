@@ -31,7 +31,18 @@ const uint32_t prop_handler_deny[] =
     // PROP_ISO was a defensive carry-over (sister D8 cams tag it "FIXME not a confirmed problem").
     // On the R a runtime PROP_ISO slave delivered fine + the handler now decodes the byte-1 code,
     // so it is allowed (read) and written -- see prop_write_allow[] below.
-    PROP_MVR_REC_START, // probably related to MVR stubs being all wrong
+    //
+    // PROP_MVR_REC_START was denied ("probably ... MVR stubs wrong") but that was precautionary, not a
+    // confirmed crash. Investigation: every PROP_MVR_REC_START handler that COMPILES for the R is benign.
+    //  - lens.c: mvr_rec_start_shoot() is EMPTY here (FEATURE_REC_NOTIFY/REC_PICSTYLE undefined) and
+    //    mvr_create_logfile is behind FEATURE_MOVIE_LOGGING (off).
+    //  - fps-engio.c: only restore_sound_recording(), a no-op while old_sound_recording_mode==-1; even
+    //    if it ran, set_sound_recording -> prop_request_change(PROP_MOVIE_SOUND_RECORD) is write-blocked.
+    //  - beep.c handler is behind FEATURE_WAV_RECORDING (off); audio-common.c is not compiled for R.
+    //  - propvalues.c just does PROP_INT(PROP_MVR_REC_START, __recording) -- a plain store.
+    // Allowing the read registers that store so __recording / RECORDING / RECORDING_H264 work. This is
+    // needed to gate movie-only work -- e.g. the raw EDMAC channel 0xD0487000 only powers up while
+    // recording, so the raw catcher must know when recording is active.
     PROP_LV_AFFRAME // so far crash only confirmed on Digic 8
 };
 
