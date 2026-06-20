@@ -1761,58 +1761,73 @@ static void edmac_scan_task(void)
  * the reg read could fault -- the per-tick log persists, so the last entry still tells us when it died.
  * -> ML/LOGS/RAWBR.TXT */
 extern void idle_wakeup_reset_counters(int reason);
-/* ---- BREADTH SCAN: which WRITE channel carries the LIVE LV stream? P14 turned out to update its
- * buffer only on CAPTURE (no cache issue -- cached==uncached==invalidated). So read MANY write-channel
- * buffer pointers (reg +0x50), checksum each buffer TWICE ~40ms apart (a frame), and flag the ones whose
- * content CHANGED (CHG=Y) -- that frame-to-frame change is the signature of the live sensor stream.
- * Crash-bisect: we flush the log BEFORE each channel's register read, so if an inactive channel faults,
- * the last logged line names the culprit. KEEP LV AWAKE (hold half-press) + VARY THE SCENE.
- * -> ML/LOGS/RAWBR.TXT */
+/* ---- MULTI-OFFSET SCAN: find the LIVE buffer. The breadth scan only checked reg +0x50 and found all
+ * frozen -- but the live buffer pointer can be at a DIFFERENT register offset (qemu-eos: EDMAC has many
+ * regs; +0x08 is "RAM address" on old DIGIC). So for each CONFIRMED-SAFE channel (0xD0404..0xD045E; the
+ * 0xD0487+ region faults) read MANY candidate offsets as buffer pointers, checksum each pointed buffer
+ * TWICE ~60ms apart, and log only the ones that CHANGE frame-to-frame (= live) + a 16-byte content
+ * sample so we can tell raw(Bayer/noise) from YUV(0x80 chroma). KEEP LV AWAKE (hold half-press) + VARY
+ * THE SCENE. Safe: only reads confirmed-mapped channels + RAM-range buffer ptrs. -> ML/LOGS/RAWBR.TXT */
+extern void idle_wakeup_reset_counters(int reason);
+#define MULTISCAN_MAXC 420
 static void raw_bright_task(void)
 {
-    /* imaging-likely WRITE-channel pBlocks (DmacInfo @0xE0DD5C64, bit0=WRITE). +0x50 = buffer ptr. */
     static const uint32_t blk[] = {
         0xd0404000,
         0xd0420000,0xd0420100,0xd0420200,0xd0420300,0xd0420400,0xd0420500,0xd0420600,0xd0420700,
+        0xd0420800,0xd0420900,0xd0420a00,0xd0420b00,0xd0420c00,
         0xd0440000,0xd0440100,0xd0440200,
         0xd045e000,0xd045e100,0xd045e200,
-        0xd0487000,0xd0487100,0xd0487200,
-        0xd04a2000,0xd04a2100,0xd04a2200,0xd04a2300,0xd04a2400,0xd04a2500,
     };
-    const int nb = (int)(sizeof(blk) / sizeof(blk[0]));
+    static const uint16_t offs[] = {0x08,0x0c,0x10,0x18,0x1c,0x20,0x28,0x2c,0x48,0x50,0x54,0x68,0x84,0xa0,0xa4,0xa8,0xac,0xb4,0xc0};
+    static uint32_t cptr[MULTISCAN_MAXC], cka[MULTISCAN_MAXC];
+    static uint16_t cblk[MULTISCAN_MAXC], coff[MULTISCAN_MAXC];
+    const int nb = (int)(sizeof(blk)/sizeof(blk[0]));
+    const int no = (int)(sizeof(offs)/sizeof(offs[0]));
     gui_stop_menu();
     msleep(300);
-    static char b[8000]; int n = 0;
+    static char b[12000]; int n = 0;
     n += snprintf(b + n, sizeof(b) - n,
-        "BREADTH: per WRITE chan: ptr=*(blk+0x50), then uncached 32KB chk TWICE ~40ms apart.\n"
-        "CHG=Y means buffer changed between reads = LIVE stream. HOLD HALF-PRESS + VARY SCENE.\n");
-    for (int round = 0; round < 3 && n < (int)sizeof(b) - 300; round++)
+        "MULTISCAN: %d safe chans x %d offsets as buf ptrs; uncached 16KB chk twice ~60ms apart.\n"
+        "Only frame-CHANGING buffers logged + 16B sample. HOLD HALF-PRESS + VARY SCENE the whole time.\n", nb, no);
+    for (int round = 0; round < 2 && n < (int)sizeof(b) - 600; round++)
     {
         idle_wakeup_reset_counters(-1);
-        n += snprintf(b + n, sizeof(b) - n, "--- round %d ---\n", round);
-        for (int i = 0; i < nb && n < (int)sizeof(b) - 80; i++)
-        {
-            /* flush BEFORE the (possibly faulting) register read so a crash pinpoints the channel */
-            FILE * ff = FIO_CreateFile("ML/LOGS/RAWBR.TXT");
-            if (ff) { FIO_WriteFile(ff, b, n); FIO_CloseFile(ff); }
-            uint32_t ptr = *(volatile uint32_t *)(blk[i] + 0x50);
-            uint32_t kA = 0, kB = 0; int valid = 0;
-            if (ptr >= 0x01000000 && ptr < 0x20000000)
+        int nc = 0;
+        for (int i = 0; i < nb; i++)
+            for (int o = 0; o < no && nc < MULTISCAN_MAXC; o++)
             {
-                valid = 1;
-                const volatile uint8_t * pu = (const volatile uint8_t *)UNCACHEABLE(ptr);
-                for (int j = 0; j < 0x8000; j += 16) kA = kA * 31 + pu[j];
-                msleep(40);   /* let a frame pass */
-                for (int j = 0; j < 0x8000; j += 16) kB = kB * 31 + pu[j];
+                uint32_t cp = *(volatile uint32_t *)(blk[i] + offs[o]) & ~0x40000000u;
+                if (cp >= 0x01000000 && cp < 0x20000000)
+                {
+                    const volatile uint8_t * pu = (const volatile uint8_t *)UNCACHEABLE(cp);
+                    uint32_t k = 0; for (int j = 0; j < 0x4000; j += 16) k = k * 31 + pu[j];
+                    cblk[nc] = (uint16_t)i; coff[nc] = offs[o]; cptr[nc] = cp; cka[nc] = k; nc++;
+                }
             }
-            n += snprintf(b + n, sizeof(b) - n, "%08x ptr=%08x kA=%08x kB=%08x CHG=%c\n",
-                (unsigned)blk[i], (unsigned)ptr, (unsigned)kA, (unsigned)kB,
-                (valid && kA != kB) ? 'Y' : 'N');
+        msleep(60);
+        idle_wakeup_reset_counters(-1);
+        int chg = 0;
+        for (int c = 0; c < nc && n < (int)sizeof(b) - 140; c++)
+        {
+            const volatile uint8_t * pu = (const volatile uint8_t *)UNCACHEABLE(cptr[c]);
+            uint32_t k = 0; for (int j = 0; j < 0x4000; j += 16) k = k * 31 + pu[j];
+            if (k != cka[c])
+            {
+                chg++;
+                n += snprintf(b + n, sizeof(b) - n, "CHG %08x+%x ptr=%08x kA=%08x kB=%08x mem:",
+                    (unsigned)blk[cblk[c]], (unsigned)coff[c], (unsigned)cptr[c], (unsigned)cka[c], (unsigned)k);
+                for (int j = 0; j < 16; j++) n += snprintf(b + n, sizeof(b) - n, " %02x", pu[j]);
+                n += snprintf(b + n, sizeof(b) - n, "\n");
+            }
         }
+        n += snprintf(b + n, sizeof(b) - n, "round %d: %d ptrs, %d changing\n", round, nc, chg);
+        FILE * f = FIO_CreateFile("ML/LOGS/RAWBR.TXT");
+        if (f) { FIO_WriteFile(f, b, n); FIO_CloseFile(f); }
     }
     FILE * f = FIO_CreateFile("ML/LOGS/RAWBR.TXT");
     if (f) { FIO_WriteFile(f, b, n); FIO_CloseFile(f); }
-    NotifyBox(5000, "Breadth scan done -> RAWBR.TXT");
+    NotifyBox(6000, "Multiscan done -> RAWBR.TXT");
 }
 
 /* ---- DUMP the P14 buffer to the card, so we can prove it's a real image (and read off geometry).
@@ -2172,8 +2187,8 @@ static struct menu_entry debug_menus[] = {
         .name        = "Raw bright test",
         .priv        = raw_bright_task,
         .select      = run_in_separate_task,
-        .help  = "IN LIVEVIEW: breadth-scan write channels for the LIVE one. HOLD HALF-PRESS, VARY SCENE.",
-        .help2 = "Flags the channel whose buffer changes frame-to-frame (CHG=Y). -> ML/LOGS/RAWBR.TXT.",
+        .help  = "IN LIVEVIEW: multi-offset scan of safe channels for the LIVE buffer. HOLD HALF-PRESS.",
+        .help2 = "Logs frame-changing buffers (CHG) + content sample. -> ML/LOGS/RAWBR.TXT.",
     },
     {
         .name        = "Dump raw buf",
