@@ -1762,45 +1762,51 @@ static void edmac_scan_task(void)
  * -> ML/LOGS/RAWBR.TXT */
 #define RAW_LV_CH_BASE 0xD0440000u   /* P14 pBlock */
 #define RAW_LV_ADDR_OFF 0x50u        /* ram_addr register offset */
+extern void idle_wakeup_reset_counters(int reason);
 static void raw_bright_task(void)
 {
     gui_stop_menu();
-    msleep(300);
-    /* read the buffer pointer ONCE (channel active now), then read the BUFFER (RAM) each tick -- RAM
-     * never deactivates, so a screen-sleep can't fault the read; chk just freezes if the DMA stops. */
-    uint32_t bufaddr = *(volatile uint32_t *)(RAW_LV_CH_BASE + RAW_LV_ADDR_OFF);
-    static char b[5500]; int n = 0;
+    msleep(200);
+    /* LIVENESS DIAGNOSTIC. Earlier test was inconclusive (cached==uncached, frozen) -- possibly because
+     * LV slept before the scene changed, OR the buffer is double-buffered (we read a fixed stale ptr),
+     * OR the uncached alias doesn't bypass cache on the R. This follows the LIVE ptr (+0x50) each tick
+     * and reads it 3 ways: cached, uncached(|0x40000000), and cached-after-explicit-dcache-INVALIDATE
+     * (DCIMVAC). Verdict: if uchk OR ichk varies while the scene changes => LIVE raw. If all 3 frozen
+     * with an active+changing scene => wrong/static buffer (P14 not the live raw). */
+    static char b[6200]; int n = 0;
     n += snprintf(b + n, sizeof(b) - n,
-        "P14 raw buf=%08x. Reading CACHED vs UNCACHED(|0x40000000) alias, 64KB, every 250ms x80 (~20s).\n"
-        "uchk varying = LIVE raw off EDMAC (DMA bypasses cpu cache). cchk is the stale cached view.\n",
-        (unsigned)bufaddr);
-    if (bufaddr < 0x01000000 || bufaddr >= 0x20000000)
+        "P14 live-raw diag: follow ptr@+0x50; cchk=cached uchk=uncached ichk=cached-after-INVALIDATE.\n"
+        "KEEP LV AWAKE (half-press shutter) and VARY THE SCENE the whole time. uchk/ichk changing = LIVE.\n");
+    for (int t = 0; t < 60 && n < (int)sizeof(b) - 80; t++)
     {
-        NotifyBox(6000, "Raw bright: bad buf ptr %08x (LV not active?)", (unsigned)bufaddr);
-        return;
-    }
-    const volatile uint8_t * pc = (const volatile uint8_t *)CACHEABLE(bufaddr);    /* cached (stale) */
-    const volatile uint8_t * pu = (const volatile uint8_t *)UNCACHEABLE(bufaddr);  /* uncached (live DMA) */
-    for (int t = 0; t < 80 && n < (int)sizeof(b) - 64; t++)
-    {
-        uint32_t sc = 0, kc = 0, su = 0, ku = 0;
-        for (int i = 0; i < 0x10000; i += 16)
+        idle_wakeup_reset_counters(-1);   /* best-effort keep-awake */
+        uint32_t ptr = *(volatile uint32_t *)(RAW_LV_CH_BASE + RAW_LV_ADDR_OFF);
+        uint32_t cchk = 0, uchk = 0, ichk = 0;
+        if (ptr >= 0x01000000 && ptr < 0x20000000)
         {
-            uint8_t vc = pc[i]; sc += vc; kc = kc * 31 + vc;
-            uint8_t vu = pu[i]; su += vu; ku = ku * 31 + vu;
+            const volatile uint8_t * pc = (const volatile uint8_t *)CACHEABLE(ptr);
+            const volatile uint8_t * pu = (const volatile uint8_t *)UNCACHEABLE(ptr);
+            for (int i = 0; i < 0x10000; i += 16) cchk = cchk * 31 + pc[i];
+            for (int i = 0; i < 0x10000; i += 16) uchk = uchk * 31 + pu[i];
+            /* invalidate this region's d-cache lines (no writeback), then re-read cached = fresh from RAM */
+            uint32_t a0 = (uint32_t)CACHEABLE(ptr) & ~0x1fu;
+            for (uint32_t a = a0; a < a0 + 0x10000; a += 0x20)
+                asm volatile ("mcr p15, 0, %0, c7, c6, 1" :: "r"(a));
+            asm volatile ("dsb");
+            for (int i = 0; i < 0x10000; i += 16) ichk = ichk * 31 + pc[i];
         }
-        n += snprintf(b + n, sizeof(b) - n, "t=%d cav=%d cchk=%08x | uav=%d uchk=%08x\n",
-            t, (int)(sc / (0x10000 / 16)), (unsigned)kc, (int)(su / (0x10000 / 16)), (unsigned)ku);
-        if ((t & 3) == 0)   /* flush every ~1s */
+        n += snprintf(b + n, sizeof(b) - n, "t=%d ptr=%08x cchk=%08x uchk=%08x ichk=%08x\n",
+            t, (unsigned)ptr, (unsigned)cchk, (unsigned)uchk, (unsigned)ichk);
+        if ((t & 3) == 0)
         {
             FILE * f = FIO_CreateFile("ML/LOGS/RAWBR.TXT");
             if (f) { FIO_WriteFile(f, b, n); FIO_CloseFile(f); }
         }
-        msleep(250);
+        msleep(150);
     }
     FILE * f = FIO_CreateFile("ML/LOGS/RAWBR.TXT");
     if (f) { FIO_WriteFile(f, b, n); FIO_CloseFile(f); }
-    NotifyBox(4000, "Raw bright test done -> RAWBR.TXT");
+    NotifyBox(5000, "live-raw diag done -> RAWBR.TXT");
 }
 #endif
 
