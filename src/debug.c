@@ -1838,23 +1838,25 @@ static void raw_dump_task(void)
 {
     gui_stop_menu();
     msleep(300);
-    uint32_t ptr = *(volatile uint32_t *)(0xD0440000u + 0x50u);   /* P14 buffer pointer */
-    if (ptr < 0x01000000 || ptr >= 0x20000000)
+    /* the LIVE channel found by the multiscan: 0xD0420700, buffer ptr at reg +0xa0 (rotating ring). */
+    uint32_t ptr = *(volatile uint32_t *)(0xD0420700u + 0xa0u);
+    uint32_t cp = ptr & ~0x40000000u;
+    if (cp < 0x01000000 || cp >= 0x20000000)
     {
-        NotifyBox(6000, "Raw dump: bad ptr %08x (take a photo first?)", (unsigned)ptr);
+        NotifyBox(6000, "Raw dump: bad ptr %08x (LV not active?)", (unsigned)ptr);
         return;
     }
-    const uint8_t * src = (const uint8_t *)UNCACHEABLE(ptr);
+    uint32_t base = cp & ~0x000FFFFFu;   /* 1MB-align down to capture the frame/ring start */
+    const uint8_t * src = (const uint8_t *)UNCACHEABLE(base);
     FILE * f = FIO_CreateFile("ML/LOGS/RAW.BIN");
     if (!f) { NotifyBox(6000, "Raw dump: cannot create RAW.BIN"); return; }
-    uint32_t total = 0x400000;   /* 4 MB */
+    uint32_t total = 0x800000;   /* 8 MB */
     for (uint32_t off = 0; off < total; off += 0x10000)
         FIO_WriteFile(f, src + off, 0x10000);
     FIO_CloseFile(f);
-    /* a tiny TXT note alongside, recording the source pointer */
     FILE * t = FIO_CreateFile("ML/LOGS/RAW.TXT");
-    if (t) { char m[80]; int k = snprintf(m, sizeof(m), "RAW.BIN = 4MB from P14 buf %08x (uncached)\n", (unsigned)ptr); FIO_WriteFile(t, m, k); FIO_CloseFile(t); }
-    NotifyBox(8000, "Dumped 4MB from %08x -> RAW.BIN", (unsigned)ptr);
+    if (t) { char m[100]; int k = snprintf(m, sizeof(m), "RAW.BIN = 8MB from D0420700+0xa0 region base %08x (live ptr %08x)\n", (unsigned)base, (unsigned)ptr); FIO_WriteFile(t, m, k); FIO_CloseFile(t); }
+    NotifyBox(8000, "Dumped 8MB @ %08x (ptr %08x) -> RAW.BIN", (unsigned)base, (unsigned)ptr);
 }
 #endif
 
@@ -2194,8 +2196,8 @@ static struct menu_entry debug_menus[] = {
         .name        = "Dump raw buf",
         .priv        = raw_dump_task,
         .select      = run_in_separate_task,
-        .help  = "TAKE A PHOTO FIRST, then dump 4MB of the P14 buffer to prove it's an image.",
-        .help2 = "For PC analysis (find width, render). -> ML/LOGS/RAW.BIN (+ RAW.TXT).",
+        .help  = "IN LIVEVIEW (hold half-press): dump 8MB of the live D0420700+0xa0 buffer.",
+        .help2 = "For PC render to confirm a moving image. -> ML/LOGS/RAW.BIN (+ RAW.TXT).",
     },
 #endif
     MENU_PLACEHOLDER("Free Memory"),
