@@ -1666,7 +1666,11 @@ static void rawhk_task(void)
             if (!rawhk_hits[c]) continue;
             uint32_t a0 = rawhk_addr[c];
             uint32_t cp = a0 & ~0x40000000u;
-            if (cp < 0x01000000u || cp >= 0x60000000u) continue;
+            /* MMU walk (MMU.TXT) confirmed 0xa0000000+ is identity-mapped, uncached, priv-RW -> the stills-raw
+             * buffers (idx24/25 @0xa0xxxxxx) read directly (UNCACHEABLE is a no-op there). Allow up to
+             * 0xc0000000 (excludes 0xC0/0xD0 MMIO + 0xE0 ROM). The 0x4x-0x7x window still round-trips via the
+             * 0x40000000 alias. The raw buffer is one contiguous >4MB allocation, so a 4MB read stays in it. */
+            if (cp < 0x01000000u || cp >= 0xc0000000u) continue;
             uint32_t * hdr = (uint32_t *)((uint8_t *)blob + bn);
             hdr[0] = 0x52415748u; hdr[1] = (uint32_t)c; hdr[2] = a0; hdr[3] = 0x20000u;   /* magic,idx,a0,len */
             bn += 16;
@@ -1682,7 +1686,7 @@ static void rawhk_task(void)
          * dumped; idx24/25 (a0 0xa0xxxxxx) are ABOVE it -> SKIPPED by the address filter (cp>=0x60000000)
          * until the MMU walk confirms their alias (their a0 is still logged in RAWHK.TXT). a0 comes from the
          * hook ARG (RAM), so faulting-region channels read fine via the arg. */
-        static const int cand[] = {59, 60, 61, 24, 25, 2};
+        static const int cand[] = {59, 60, 61, 2, 24, 25};   /* 24/25 (0xa0... = prime stills raw) LAST -- saved-first safety */
         for (unsigned ci = 0; ci < sizeof(cand) / sizeof(cand[0]); ci++)
         {
             int c = cand[ci];
