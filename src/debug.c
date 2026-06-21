@@ -1687,7 +1687,8 @@ static void rawhk_task(void)
         if (stg && a24)
         {
             uint32_t cp = a24 & ~0x40000000u;
-            for (uint32_t o = 0; o < stagesz; o += 0x100000u)        /* fast MMU-checked grab -- beats the clear */
+            uint32_t ss_end = (cp & 0xFF000000u) + 0x01000000u;      /* end of cp's 16MB supersection: 0xa4+ is */
+            for (uint32_t o = 0; o < stagesz && (cp + o) < ss_end; o += 0x100000u)  /* only sometimes backed (=crash) */
             {
                 if (!A3_MAPPED(cp + o)) break;
                 memcpy((uint8_t *)stg + o, (void *)UNCACHEABLE(cp + o), 0x100000u);
@@ -1920,11 +1921,19 @@ static void srmprobe_task(void)
     void * localbuf = 0;
     void * cbrp = (void *)srmp_cbr;                       /* (void*) intermediate -> no cast-function-type */
     srmp_buf = 0; srmp_sz = 0; srmp_done = 0;
-    NotifyBox(8000, "SRM probe: allocating via RscMgr...");
+    /* Replicate ML's srm_alloc protocol (exmem.c srm_shutter_lock): LOCK THE SHUTTER before allocating. The
+     * For1stJob allocator has an internal race-condition test that silently DROPS the request unless the
+     * shutter is locked -- v1 skipped this -> done=0. */
+    extern int icu_uilock;
+    extern void gui_uilock(int);
+    gui_uilock(icu_uilock | 0x0001);                     /* UILOCK_SHUTTER */
+    msleep(60);
+    NotifyBox(8000, "SRM probe: shutter locked, allocating via RscMgr...");
     beep();
     r_srm_alloc(cbrp, &localbuf);                         /* async: RscMgr task will call srmp_cbr */
     int waited = 0;
     while (!srmp_done && waited < 3000) { msleep(20); waited += 20; }
+    gui_uilock(icu_uilock & ~0x0001);                    /* unlock the shutter (we free the buffer below) */
     char b[260]; int n = snprintf(b, sizeof(b),
         "SRM probe: done=%d buf=%08x size=%08x (%uMB) waited=%dms localbuf=%08x\n"
         "done=1 & size>0 => SRM WORKS on R. Set SRM_BUFFER_SIZE=0x%x in consts.h, add the two stubs, drop\n"
