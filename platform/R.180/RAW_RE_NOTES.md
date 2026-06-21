@@ -461,3 +461,38 @@ CONCLUSION:
   This is the raw-track camera probe. (Each timelapse frame is already a CR3; this is ML reading the raw
   buffer directly, toward an ML DNG pipeline.)
 => Both tracks camera-ready: (A) adaptive timelapse test, (B) Dpraw-stills raw via "Rec dump" + a DPRAW photo.
+
+## 18. COMPREHENSIVE RAW-PIXEL FLOW MAP (EOS R) -- when/where/how raw pixels move, + non-destructive taps
+### Stages (sensor -> RAM)
+1. Sensor -> Front-End (FE) / A-D -> 14-bit sensor raw (Dual Pixel: 2 photodiodes A/B per photosite).
+2. FE raw -> EDMAC **connection 0** (the sensor-raw source; qemu-eos: conn 0/35 = sensor data).
+3. From conn 0, the path FORKS by mode:
+   - **LV / MOVIE:** the imaging engine (IPP) debayers conn0 upstream. What lands in CPU-readable RAM is
+     only PROCESSED planes -- debayered previews (idx30 = the ~640-wide kitchen luma; idx4/5/6/...), stats,
+     structured buffers. **The full-res 14-bit Bayer is NEVER written to a CPU-readable buffer in LV/movie**
+     -> the video full-res raw is the HARD LIMIT (slurp hangs; EVF hook crashes; not buffered).
+   - **STILLS (image quality RAW + Canon Dual Pixel RAW ON):** during a PHOTO, the still-capture pipeline
+     programs the **0xD0487 EDMAC channels** (idx23-25, idx58-61) with the FULL-RES raw -- these channels are
+     ABSENT in LV/movie. So the **stills full-res raw IS reachable** (the +0xa0 hook captured their buffer
+     addrs). Observed (DPRAW photo): idx24 a0=a32df198, idx25 a0=a00038cc (hits 16/14); idx59 a0=76eea878,
+     idx60 a0=6fa10000, idx61 a0=76f0df5c (hits 2).
+
+### Memory / MMU (the read-path)
+- R uncached aliasing (mem_defs.h, non-VXWORKS): **UNCACHEABLE(x)= x | (x<0x40000000 ? 0x40000000 : 0)**,
+  CACHEABLE(x)= x & ~0x40000000. => **cached RAM 0x00000000-0x3FFFFFFF; uncached alias 0x40000000-0x7FFFFFFF**
+  (1GB window). LV preview + stills buffers in 0x4x-0x7x are CPU-READABLE this way (proven: the kitchen render,
+  idx59/60/61).
+- **OPEN (MMU crux):** the active stills-raw buffers (idx24/25, a0=0xa0xxxxxx) are ABOVE the 0x40000000 alias
+  window. CONFIG_MEM_2GB => 2GB RAM with an "unusual map"; 0xa0000000 is likely 2nd-GB RAM or a high uncached
+  alias, but the alias bit (0x40000000? 0x80000000?) / validity is UNVERIFIED. Reading it blind from a task
+  could data-abort. NEXT: determine 0xa0000000's mapping by RE'ing the still-capture allocator
+  (SCS_FaAllocateMemoryResourceForDpRawCaptureBuffer @str e005836c / FA_GetDPRawBuf @str e0058df8) OR the
+  Canon MMU TTBR/L1 table, to get the safe cached twin. THEN the dump can read idx24/25.
+
+### Interception -- non-destructive (use) vs destructive (avoid)
+- **NON-DESTRUCTIVE (validated):** the +0xa0 hook on FUN_e05364b6 reads each channel's buffer ADDRESS from
+  Canon's own per-frame write -- it disturbs nothing (re-does the exact store), no DMA reconfiguration. Reading
+  the buffer via the cached/uncached alias is a pure CPU read. This is THE safe interceptor.
+- **DESTRUCTIVE (proven, avoid):** commandeering a free EDMAC channel + StartEDmac on conn0 -> Err70 / hard
+  hang (free chans lack Canon's transfer/ISR infra). EVF state-object hook -> EvfCap crash. Reading the d0487
+  channel REGISTERS directly -> data-abort (but the +0xa0 hook gives the buffer addr, sidestepping this).
