@@ -1683,45 +1683,46 @@ static void rawhk_task(void)
             if (h && h == last) { if (++stable >= 3) { quiesced = 1; break; } }   /* ~60ms no new idx24 write */
             else { stable = 0; last = h; }
         }
-        uint32_t a24 = rawhk_addr[24], a25 = rawhk_addr[25], f24 = 0, f25 = 0, got = 0;
-        if (stg && a24)
+        /* Grab ALL 0xD0487 channels: the full frame is SPLIT across them (Canon writes ~16MB pieces to different
+         * regions = the "rotation" hypothesis). Reading each channel's OWN buffer, capped to its 16MB
+         * supersection + MMU-checked, is crash-safe -- the earlier reboot was reading PAST idx24 into unbacked
+         * 0xa4 (no buffer there). Each -> RWF<idx>.BIN; first word logged so we see which stayed valid = the
+         * time budget for capturing the whole frame in one shot. Assemble RWF*.BIN into one frame offline. */
+        static const int chans[] = { 24, 25, 58, 59, 60, 61 };
+        char tb[720]; int tn = 0;
+        tn += snprintf(tb + tn, sizeof(tb) - tn,
+            "FULL-FRAME grab (all d0487 chans, each capped to its supersection). waited=%dms q=%d stage=%uMB\n"
+            "first != aa/55 => caught live; assemble RWF*.BIN -> one dual-pixel frame:\n",
+            waited, quiesced, (unsigned)(stagesz >> 20));
+        for (unsigned ci = 0; ci < sizeof(chans) / sizeof(chans[0]); ci++)
         {
-            uint32_t cp = a24 & ~0x40000000u;
-            uint32_t ss_end = (cp & 0xFF000000u) + 0x01000000u;      /* end of cp's 16MB supersection: 0xa4+ is */
-            for (uint32_t o = 0; o < stagesz && (cp + o) < ss_end; o += 0x100000u)  /* only sometimes backed (=crash) */
+            int c = chans[ci];
+            uint32_t a = rawhk_addr[c];
+            if (!stg || !a) { tn += snprintf(tb + tn, sizeof(tb) - tn, "idx%d: (no addr)\n", c); continue; }
+            uint32_t cp = a & ~0x40000000u;
+            uint32_t ss_end = (cp & 0xFF000000u) + 0x01000000u;   /* this buffer's supersection -- never over-read */
+            uint32_t got = 0;
+            for (uint32_t o = 0; o < stagesz && (cp + o) < ss_end; o += 0x100000u)
             {
                 if (!A3_MAPPED(cp + o)) break;
                 memcpy((uint8_t *)stg + o, (void *)UNCACHEABLE(cp + o), 0x100000u);
                 got = o + 0x100000u;
             }
-            f24 = *(volatile uint32_t *)stg;
-            FILE * df = FIO_CreateFile("ML/LOGS/RWGF24.BIN");
+            uint32_t first = got ? *(volatile uint32_t *)stg : 0;
+            char nm[24]; snprintf(nm, sizeof(nm), "ML/LOGS/RWF%d.BIN", c);
+            FILE * df = FIO_CreateFile(nm);
             if (df) { for (uint32_t o = 0; o < got; o += 0x10000u) FIO_WriteFile(df, (uint8_t *)stg + o, 0x10000u); FIO_CloseFile(df); }
-        }
-        if (stg && a25)                                              /* idx25 (2nd DPRAW plane) -- 4MB reference */
-        {
-            uint32_t cp = a25 & ~0x40000000u, g = 0;
-            for (uint32_t o = 0; o < 0x400000u; o += 0x100000u) { if (!A3_MAPPED(cp + o)) break; memcpy((uint8_t *)stg + o, (void *)UNCACHEABLE(cp + o), 0x100000u); g = o + 0x100000u; }
-            f25 = *(volatile uint32_t *)stg;
-            FILE * df = FIO_CreateFile("ML/LOGS/RWGF25.BIN");
-            if (df) { for (uint32_t o = 0; o < g; o += 0x10000u) FIO_WriteFile(df, (uint8_t *)stg + o, 0x10000u); FIO_CloseFile(df); }
+            tn += snprintf(tb + tn, sizeof(tb) - tn, "idx%d a=%08x first=%08x got=%dMB hits=%d\n",
+                           c, (unsigned)a, (unsigned)first, (int)(got >> 20), (int)rawhk_hits[c]);
         }
         if (stg) fio_free(stg);
 #undef A3_MAPPED
-        char tb[440]; int tn = 0;
-        tn += snprintf(tb + tn, sizeof(tb) - tn,
-            "stillgrab FULL: idx24 hits=%d a0=%08x first=%08x staged=%uMB(stage %uMB) | idx25 a0=%08x first=%08x | waited=%dms q=%d\n",
-            (int)rawhk_hits[24], (unsigned)a24, (unsigned)f24, (unsigned)(got >> 20), (unsigned)(stagesz >> 20),
-            (unsigned)a25, (unsigned)f25, waited, quiesced);
-        tn += snprintf(tb + tn, sizeof(tb) - tn, "idx24 seq(n=%d):", (int)rawhk_seqn);
-        for (int k = 0; k < rawhk_seqn && k < RAWHK_SEQ; k++) tn += snprintf(tb + tn, sizeof(tb) - tn, " %08x", (unsigned)rawhk_seq[k]);
-        tn += snprintf(tb + tn, sizeof(tb) - tn, "\nfirst != aa/55 => live raw; seq = per-strip buffer addrs (for full-frame assembly).\n");
         FILE * tf = FIO_CreateFile("ML/LOGS/STILLGRAB.TXT");
         if (tf) { FIO_WriteFile(tf, tb, tn); FIO_CloseFile(tf); }
         msleep(300);
         rawhk_on = 0; msleep(50);
         unpatch_memory(0xE05364B6);
-        NotifyBox(13000, "Stills grab: %uMB staged f=%08x -> RWGF24.BIN", (unsigned)(got >> 20), (unsigned)f24);
+        NotifyBox(13000, "Full-frame grab done -> RWF*.BIN + STILLGRAB.TXT");
         return;
     }
     msleep(7000);   /* let every channel populate (raw LV or recording) */
