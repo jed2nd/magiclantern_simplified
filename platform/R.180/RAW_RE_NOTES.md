@@ -496,3 +496,36 @@ CONCLUSION:
 - **DESTRUCTIVE (proven, avoid):** commandeering a free EDMAC channel + StartEDmac on conn0 -> Err70 / hard
   hang (free chans lack Canon's transfer/ISR infra). EVF state-object hook -> EvfCap crash. Reading the d0487
   channel REGISTERS directly -> data-abort (but the +0xa0 hook gives the buffer addr, sidestepping this).
+
+## 19. STILLS RAW LIFECYCLE + LIVE CAPTURE (2026-06-20 night) -- RESOLVES the sec-18 MMU crux
+
+### MMU 0xa0/0xa3 question -- SETTLED (camera + Ghidra ground truth, not notes)
+- Live MMU walk (Debug->"MMU walk" reads the REAL TTBR0/TTBR1 per TTBCR): **TTBCR.N=7 splits VAs at 0x02000000**
+  (<split=TTBR0, >=split=TTBR1 = the LIVE high-mem table). The 0xe0000000 const IS a real ROM-resident master
+  L1 table but is NOT the live authority -- read TTBR1.
+- **0xa0000000 / 0xa3000000 are identity-mapped 16MB SUPERSECTIONS** (entry 0xa3054402, bit18=1), AP=1
+  (privileged RW), TEX=4. They ARE CPU-readable. The earlier idx24 "fault" was a FILTER BUG (the dumpfull
+  filter still had cp>=0x60000000 -> silently skipped idx24/25; the faulting read never actually happened).
+- A3 read-probe (Debug->"Probe a3 rd"): reads of 0x40/0x76/0xa0/0xa3000000/0xa3200000 all SURVIVE. At idle the
+  0xa3 bank holds 0xAA/0x55 **clear-fill** => DMA scratch buffers wiped when no shot is live. The MAPPING is
+  static (reads never fault); only the CONTENT is transient.
+
+### The raw is TRANSIENT (the real obstacle, not the MMU)
+- Full-res stills raw lives in the 0xa3 bank ONLY DURING a shot. The +0xa0 hook captures idx24's live addr
+  (a0=0xa3xxxxxx); the old dump ran ~7s later -> read 0xAA fill (why RW24/25 looked empty/were skipped).
+- LIFECYCLE (Ghidra, **Warp/ShtCapCorrectPath.c**): a resource manager sequences GET (msg 0x11, wait evt
+  0x10000 = FUN_e064dc98) -> CORRECTION (msg 0x13, wait evt 0x40000 = FUN_e064dd38) -> RELEASE (msg 0x12, wait
+  evt 0x20000 = FUN_e064dce8); orchestrated by FUN_e066bfd8/FUN_e066c41a. The raw buffer is allocated at GET,
+  filled by the sensor EDMAC (idx24), consumed by CORRECTION, freed at RELEASE. **Valid window = idx24 DMA-done
+  .. RELEASE** (correction takes real time -> a grab right after the idx24 burst should land inside it).
+
+### Capture strategy
+- **PRIMARY (built + deployed): Debug->"Stills grab"** (stillgrab_task). Arms the +0xa0 hook; polls until
+  idx24's write-burst quiesces (~60ms no new hit = DMA done); immediately memcpy's the buffer to RAM staging
+  (beats Canon's clear) -> RWG24/RWG25.BIN + STILLGRAB.TXT. **first word != aa../55.. => caught the LIVE raw.**
+- **FALLBACK (if grab still reads 0xAA = too slow): hook FUN_e064dd38 (CORRECTION entry)** -- raw guaranteed
+  valid there (param_1 = pParameter job struct; needs a little struct RE to pull the buffer ptr).
+- LV-res raw (idx2/30, 0x6x region) stays persistently CPU-readable = the ML-raw-VIDEO path (distinct from the
+  full-res stills bank). idx24 geometry: full-res ~6720x4480 14-bit (11760 B/row) => a 4MB grab = top ~356 rows.
+- Tooling: Ghidra headless RE works via ~/gscripts/run_decomp.sh (clears the stale lock, uses dump_decomp.java
+  / xrefs_to.java); JAVA_HOME=~/ghidra-setup/jdk. Dead slurp/EVF code removed (BSS 0x144800->0x143300).
