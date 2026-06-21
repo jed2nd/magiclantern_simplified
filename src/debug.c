@@ -1897,6 +1897,46 @@ static void a3probe_task(void)
     NotifyBox(9000, "a3probe: ALL reads survived -> A3PROBE.TXT (bank is CPU-readable)");
 }
 
+/* ---- SRM PROBE (Debug -> "SRM probe").  SRM (the RscMgr large-buffer allocator ML uses for raw video) is
+ * disabled on R (CONFIG_MEMORY_SRM_NOT_WORKING) -- but Ghidra confirms the stubs are correct and just unfinished:
+ *   SRM_AllocateMemoryResourceFor1stJob = 0xE04E41BE (Resource/RscMgr.c: posts alloc cmd 0xa1 + CBR to RscMgr)
+ *   SRM_FreeMemoryResourceFor1stJob     = 0xE04E7590 (matching free)
+ * Both are ASYNC: post a message to the RscMgr task, which allocates ~30-40MB and calls our CBR with the buffer
+ * + its size. This probe calls the allocator, waits for the CBR, logs buffer+SIZE (= SRM_BUFFER_SIZE, the one
+ * missing const), then frees it. Menu-invoked (recoverable), does NOT touch boot. Confirms SRM works on R and
+ * yields SRM_BUFFER_SIZE -> then we can enable SRM properly (full 52MB stills stage + raw video). -> SRMPROBE.TXT */
+static volatile uint32_t srmp_buf, srmp_sz;
+static volatile int srmp_done;
+static void srmp_cbr(void ** dst, void * buf, uint32_t sz)   /* matches srm_malloc_cbr(dst, raw_buf, raw_buf_size) */
+{
+    srmp_buf = (uint32_t)buf; srmp_sz = sz; if (dst) *dst = buf; srmp_done = 1;
+}
+static void srmprobe_task(void)
+{
+    gui_stop_menu();
+    msleep(300);
+    void (*srm_alloc)(void *, void *)      = (void *)(0xE04E41BEu | 1);
+    void (*srm_free)(uint32_t, int, int)   = (void *)(0xE04E7590u | 1);
+    void * localbuf = 0;
+    void * cbrp = (void *)srmp_cbr;                       /* (void*) intermediate -> no cast-function-type */
+    srmp_buf = 0; srmp_sz = 0; srmp_done = 0;
+    NotifyBox(8000, "SRM probe: allocating via RscMgr...");
+    beep();
+    srm_alloc(cbrp, &localbuf);                           /* async: RscMgr task will call srmp_cbr */
+    int waited = 0;
+    while (!srmp_done && waited < 3000) { msleep(20); waited += 20; }
+    char b[260]; int n = snprintf(b, sizeof(b),
+        "SRM probe: done=%d buf=%08x size=%08x (%uMB) waited=%dms localbuf=%08x\n"
+        "done=1 & size>0 => SRM WORKS on R. Set SRM_BUFFER_SIZE=0x%x in consts.h, add the two stubs, drop\n"
+        "CONFIG_MEMORY_SRM_NOT_WORKING -> full 52MB stills stage + raw-video buffers.\n",
+        srmp_done, (unsigned)srmp_buf, (unsigned)srmp_sz, (unsigned)(srmp_sz >> 20), waited,
+        (unsigned)(uintptr_t)localbuf, (unsigned)srmp_sz);
+    FILE * f = FIO_CreateFile("ML/LOGS/SRMPROBE.TXT");
+    if (f) { FIO_WriteFile(f, b, n); FIO_CloseFile(f); }
+    if (srmp_buf) { srm_free(srmp_buf, 0, 0); msleep(200); }   /* give the buffer back */
+    NotifyBox(12000, "SRM probe: %uMB done=%d -> SRMPROBE.TXT", (unsigned)(srmp_sz >> 20), srmp_done);
+}
+
 /* ---- RAW BRIGHTNESS + SCREEN-SLEEP TEST (Debug -> "Raw bright test").
  * We found the LV raw write channel: DmacInfo Port 14 = pBlock 0xD0440000, buffer-pointer reg at
  * +0x50, content = uncompressed Bayer. This averages that buffer over ~80s while logging a checksum,
@@ -2562,6 +2602,13 @@ static struct menu_entry debug_menus[] = {
         .select      = run_in_separate_task,
         .help  = "CRASH-TEST: reads 0x40/0x76 (must pass) then 0xa0/0xa3 (stills-raw bank). May crash.",
         .help2 = "Settles if 0xa3 is CPU-readable or imaging-DMA-only. -> ML/LOGS/A3PROBE.TXT (last line=culprit).",
+    },
+    {
+        .name        = "SRM probe",
+        .priv        = srmprobe_task,
+        .select      = run_in_separate_task,
+        .help  = "Tests the disabled SRM allocator (RscMgr 0xE04E41BE). Logs the buffer + SIZE it returns.",
+        .help2 = "Yields SRM_BUFFER_SIZE so we can enable SRM (full 52MB stills + raw video). -> SRMPROBE.TXT.",
     },
     {
         .name        = "Raw bright test",
