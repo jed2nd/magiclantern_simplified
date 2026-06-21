@@ -1611,6 +1611,14 @@ void rawhk_wrapper(uint32_t chan, uint32_t addr)
 static int rawhk_rawlv = 0;
 static int rawhk_dumpfull = 0;
 static int rawhk_stillgrab = 0;
+/* SOFTWARE SHUTTER: fire the capture ourselves (scripted -- no manual press) from a spawned task, so the grab
+ * task can poll the +0xa0 hook concurrently and catch the buffers WHILE the shot is in progress.
+ * lens_take_picture is the R's validated capture path (used by the intervalometer/bracketing). */
+static void sg_shutter(void)
+{
+    msleep(600);                            /* let the grab task settle into its poll loop first */
+    lens_take_picture(64, AF_DONT_CHANGE);  /* fire one photo, leaving the camera's AF setting as-is */
+}
 static void rawhk_task(void)
 {
     gui_stop_menu();
@@ -1655,7 +1663,7 @@ static void rawhk_task(void)
     }
 
     rawhk_on = 1;
-    NotifyBox(13000, stillgrab ? "STILLS GRAB ARMED -- take ONE photo (RAW + Dual Pixel RAW) now!"
+    NotifyBox(13000, stillgrab ? "STILLS GRAB: auto-firing 1 photo (set RAW + Dual Pixel RAW first!)"
                      : rawlv    ? "RAW-LV HOOK ARMED -- hold still in LiveView (10s)"
                                 : "RAW HOOK ARMED -- press REC and RECORD now (12s)!");
     beep();
@@ -1669,6 +1677,7 @@ static void rawhk_task(void)
          * (read the LIVE TTBR1 L1 entry; stop at the first unmapped supersection) so reads past 0xa3ffffff into
          * 0xa4.. can't fault. Records all idx24 +0xa0 addresses (rawhk_seq) = the per-strip layout for later
          * full-frame assembly. -> ML/LOGS/RWGF24.BIN (+ RWGF25.BIN) + STILLGRAB.TXT. */
+        task_create("sgshut", 0x1a, 0x2000, (void *)sg_shutter, 0);   /* fire the photo ourselves (scripted) */
         uint32_t ttbr1 = 0; asm volatile ("mrc p15, 0, %0, c2, c0, 1" : "=r"(ttbr1));
         uint32_t t1 = ttbr1 & ~0x3FFFu;
 #define A3_MAPPED(va) ((*(volatile uint32_t *)(t1 + (((va) >> 20) << 2)) & 3u) != 0u)
@@ -1700,9 +1709,12 @@ static void rawhk_task(void)
             uint32_t a = rawhk_addr[c];
             if (!stg || !a) { tn += snprintf(tb + tn, sizeof(tb) - tn, "idx%d: (no addr)\n", c); continue; }
             uint32_t cp = a & ~0x40000000u;
-            uint32_t ss_end = (cp & 0xFF000000u) + 0x01000000u;   /* this buffer's supersection -- never over-read */
+            /* main-RAM channels (orig addr 0x4x-0x7x) are fully backed -> read the whole 16MB stage. Only the
+             * imaging banks (0xa0+) have unbacked neighbours (0xa4+) -> cap those at their 16MB supersection. */
+            uint32_t lim = stagesz;
+            if (a >= 0x80000000u) { uint32_t e = (cp & 0xFF000000u) + 0x01000000u; if (e - cp < lim) lim = e - cp; }
             uint32_t got = 0;
-            for (uint32_t o = 0; o < stagesz && (cp + o) < ss_end; o += 0x100000u)
+            for (uint32_t o = 0; o < lim; o += 0x100000u)
             {
                 if (!A3_MAPPED(cp + o)) break;
                 memcpy((uint8_t *)stg + o, (void *)UNCACHEABLE(cp + o), 0x100000u);
