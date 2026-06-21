@@ -292,6 +292,16 @@ static int adaptive_exposure_step(void)
     }
     return avgY;
 }
+
+/* menu display: show the raw exposure bounds as real shutter / ISO instead of ML raw numbers */
+static MENU_UPDATE_FUNC(adapt_shutter_disp)
+{
+    MENU_SET_VALUE("%s", lens_format_shutter(MENU_CURRENT_VALUE));
+}
+static MENU_UPDATE_FUNC(adapt_iso_disp)
+{
+    MENU_SET_VALUE("ISO %d", raw2iso(MENU_CURRENT_VALUE));
+}
 #endif /* FEATURE_INTERVALOMETER */
 int motion_detect = 0; //int motion_detect_level = 8;
 #ifdef FEATURE_AUDIO_REMOTE_SHOT
@@ -3583,8 +3593,9 @@ static struct menu_entry shoot_menus[] = {
                 .priv       = &adapt_shutter_min,
                 .min        = 16,
                 .max        = 152,
+                .update     = adapt_shutter_disp,
                 .icon_type  = IT_PERCENT,
-                .help  = "Slowest shutter the ramp may use (ML raw; lower = slower).",
+                .help  = "Slowest shutter the ramp may use (lower = slower).",
                 .help2 = "Floor to avoid motion blur. Below this, the ramp raises ISO instead.",
             },
             {
@@ -3592,16 +3603,18 @@ static struct menu_entry shoot_menus[] = {
                 .priv       = &adapt_shutter_max,
                 .min        = 16,
                 .max        = 160,
+                .update     = adapt_shutter_disp,
                 .icon_type  = IT_PERCENT,
-                .help  = "Fastest shutter the ramp may use (ML raw; higher = faster, ~152 = 1/8000).",
+                .help  = "Fastest shutter the ramp may use (higher = faster).",
             },
             {
                 .name = "ISO ceiling",
                 .priv       = &adapt_iso_max,
                 .min        = 72,
                 .max        = 128,
+                .update     = adapt_iso_disp,
                 .icon_type  = IT_PERCENT,
-                .help  = "Highest ISO for the ramp (ML raw; 72=ISO100 +8/stop, 112=ISO6400).",
+                .help  = "Highest ISO the ramp may use (spilled to only when the shutter hits its floor).",
                 .help2 = "Used only when the shutter hits its floor (low light). Caps noise.",
             },
             MENU_EOL
