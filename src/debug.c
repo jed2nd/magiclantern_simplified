@@ -1972,20 +1972,26 @@ static void srmregions_task(void)
     /* Curated SAFE areas (the size fn FUN_e044f7e8 returns a value, no "isn't Exist" assert): 4/5 = SRM video
      * pool, 0x2c/0x53/0x55 = 76MB (0x4c00000) pools = the full-frame lead, 0x2d/0x54/0x56 = PlayBack. addr=0 =>
      * configured but not allocated now; a big NON-ZERO addr => a large buffer we may grab into directly. */
-    static const int areas[] = { 4, 5, 0x2c, 0x2d, 0x53, 0x54, 0x55, 0x56 };
-    char b[760]; int n = 0;
-    n += snprintf(b + n, sizeof(b) - n, "Memory AREA scan (idx0 addr+size). big+allocated = full-frame buffer:\n");
+    /* STAGED: an earlier blind scan CRASHED+rebooted (an accessor faults for an unallocated area). Flush the
+     * log BEFORE every call, so a crash leaves the culprit (which area, size? or addr?) as the last line and we
+     * still keep all the safe areas' data. size (FUN_e044f7e8) is a pure switch = safe; addr (FUN_e044f576)
+     * computes base+idx*stride and can fault if the area's base global is null/unallocated. 4/5 known-safe. */
+    static const int areas[] = { 4, 5, 0x2c, 0x53, 0x55, 0x2d, 0x54, 0x56 };
+    char b[820]; int n = 0;
+    n += snprintf(b + n, sizeof(b) - n, "Area scan STAGED (last line = culprit if it crashed). 4/5 known-safe:\n");
     for (unsigned a = 0; a < sizeof(areas) / sizeof(areas[0]); a++)
     {
         int area = areas[a];
-        uint32_t ad = (uint32_t)r_addr((uint32_t)area, 0);
+        n += snprintf(b + n, sizeof(b) - n, "area 0x%02x size?", area);
+        { FILE * f = FIO_CreateFile("ML/LOGS/SRMREGIONS.TXT"); if (f) { FIO_WriteFile(f, b, n); FIO_CloseFile(f); } }
         uint32_t sz = (uint32_t)r_size(area, 0);
-        n += snprintf(b + n, sizeof(b) - n, "area 0x%02x: addr=%08x size=%08x (%dMB)\n",
-                      area, (unsigned)ad, (unsigned)sz, (int)(sz >> 20));
+        n += snprintf(b + n, sizeof(b) - n, "=%08x addr?", (unsigned)sz);
+        { FILE * f = FIO_CreateFile("ML/LOGS/SRMREGIONS.TXT"); if (f) { FIO_WriteFile(f, b, n); FIO_CloseFile(f); } }
+        uint32_t ad = (uint32_t)r_addr((uint32_t)area, 0);
+        n += snprintf(b + n, sizeof(b) - n, "=%08x ok\n", (unsigned)ad);
+        { FILE * f = FIO_CreateFile("ML/LOGS/SRMREGIONS.TXT"); if (f) { FIO_WriteFile(f, b, n); FIO_CloseFile(f); } }
     }
-    FILE * f = FIO_CreateFile("ML/LOGS/SRMREGIONS.TXT");
-    if (f) { FIO_WriteFile(f, b, n); FIO_CloseFile(f); }
-    NotifyBox(12000, "SRM regions -> SRMREGIONS.TXT");
+    NotifyBox(12000, "Area scan done (all OK) -> SRMREGIONS.TXT");
 }
 
 /* ---- RAW BRIGHTNESS + SCREEN-SLEEP TEST (Debug -> "Raw bright test").
