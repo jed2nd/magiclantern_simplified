@@ -1698,7 +1698,7 @@ static void rawhk_task(void)
          * 0xa4 (no buffer there). Each -> RWF<idx>.BIN; first word logged so we see which stayed valid = the
          * time budget for capturing the whole frame in one shot. Assemble RWF*.BIN into one frame offline. */
         static const int chans[] = { 24, 25, 58, 59, 60, 61 };
-        char tb[720]; int tn = 0;
+        char tb[1600]; int tn = 0;
         tn += snprintf(tb + tn, sizeof(tb) - tn,
             "FULL-FRAME grab (all d0487 chans, each capped to its supersection). waited=%dms q=%d stage=%uMB\n"
             "first != aa/55 => caught live; assemble RWF*.BIN -> one dual-pixel frame:\n",
@@ -1726,6 +1726,39 @@ static void rawhk_task(void)
             if (df) { for (uint32_t o = 0; o < got; o += 0x10000u) FIO_WriteFile(df, (uint8_t *)stg + o, 0x10000u); FIO_CloseFile(df); }
             tn += snprintf(tb + tn, sizeof(tb) - tn, "idx%d a=%08x first=%08x got=%dMB hits=%d\n",
                            c, (unsigned)a, (unsigned)first, (int)(got >> 20), (int)rawhk_hits[c]);
+        }
+        /* STRIP WALK (Gemini + Jed's sliding-window/rotation model): idx24's +0xa0 fires once per ~16MB strip as
+         * the sensor streams the frame; rawhk_seq is that strip layout (a3..a9). Re-read each recorded strip addr
+         * here -- the ones still mapped + non-0xAA = how much of the full frame survives to grab time. Distinct
+         * 16MB bases each -> RWS<n>.BIN (offline: concatenate in s-order for one full dual-pixel frame). If most
+         * strips read map=0/0xAA, the window already slid past -> escalate to a per-strip (CORRECTION-event) hook. */
+        tn += snprintf(tb + tn, sizeof(tb) - tn, "idx24 strip seq (n=%d) -- the per-strip a3..a9 layout:\n", rawhk_seqn);
+        uint32_t wbase[RAWHK_SEQ]; int wn = 0;
+        for (int s = 0; s < rawhk_seqn && stg; s++)
+        {
+            uint32_t sa = rawhk_seq[s];
+            uint32_t cp = sa & ~0x40000000u;
+            uint32_t base = cp & 0xFF000000u;
+            int dup = 0; for (int k = 0; k < wn; k++) if (wbase[k] == base) { dup = 1; break; }
+            int mapped = A3_MAPPED(cp);
+            uint32_t first = 0, got = 0;
+            if (mapped && !dup)
+            {
+                if (wn < (int)RAWHK_SEQ) wbase[wn++] = base;
+                uint32_t lim = stagesz, e = base + 0x01000000u; if (e - cp < lim) lim = e - cp;
+                for (uint32_t o = 0; o < lim; o += 0x100000u)
+                {
+                    if (!A3_MAPPED(cp + o)) break;
+                    memcpy((uint8_t *)stg + o, (void *)UNCACHEABLE(cp + o), 0x100000u);
+                    got = o + 0x100000u;
+                }
+                first = got ? *(volatile uint32_t *)stg : 0;
+                char nm[24]; snprintf(nm, sizeof(nm), "ML/LOGS/RWS%d.BIN", s);
+                FILE * sf = FIO_CreateFile(nm);
+                if (sf) { for (uint32_t o = 0; o < got; o += 0x10000u) FIO_WriteFile(sf, (uint8_t *)stg + o, 0x10000u); FIO_CloseFile(sf); }
+            }
+            tn += snprintf(tb + tn, sizeof(tb) - tn, "  s%d a=%08x map=%d dup=%d first=%08x got=%dMB\n",
+                           s, (unsigned)sa, mapped, dup, (unsigned)first, (int)(got >> 20));
         }
         if (stg) fio_free(stg);
 #undef A3_MAPPED
