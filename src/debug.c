@@ -1942,14 +1942,15 @@ static void srmprobe_task(void)
     int waited = 0;
     while (!srmp_done && waited < 3000) { msleep(20); waited += 20; }
     gui_uilock(icu_uilock & ~0x0001);                    /* unlock the shutter (we free the buffer below) */
-    char b[380]; int n = snprintf(b, sizeof(b),
+    char b[420]; int n = snprintf(b, sizeof(b),
         "SRM probe: done=%d buf=%08x size=%08x (%uMB) waited=%dms localbuf=%08x\n"
         "SRM state machine: rscmgr=%08x stateobj=%08x sig=%08x curState=%d rscmgr+0x150=%d\n"
-        "(alloc gated by hStateObject; done=0 => curState rejects the alloc event, need ST_NORMAL_SRM.\n"
-        " done=1 & size>0 => SRM WORKS, SRM_BUFFER_SIZE=0x%x.)\n",
+        "CONTEXT: lv=%d movie=%d shooting_mode=%d   <-- compare curState across idle/LV/movie\n"
+        "(alloc gated by hStateObject; done=0 => curState rejects the alloc, need ST_NORMAL_SRM. If curState\n"
+        " becomes non-0 in LV/movie -> that mode is the precondition. done=1 & size>0 => SRM WORKS, SIZE=0x%x.)\n",
         srmp_done, (unsigned)srmp_buf, (unsigned)srmp_sz, (unsigned)(srmp_sz >> 20), waited,
         (unsigned)(uintptr_t)localbuf, (unsigned)rscmgr, (unsigned)stateo, (unsigned)signat,
-        (int)curst, (int)st150, (unsigned)srmp_sz);
+        (int)curst, (int)st150, lv, is_movie_mode(), shooting_mode, (unsigned)srmp_sz);
     FILE * f = FIO_CreateFile("ML/LOGS/SRMPROBE.TXT");
     if (f) { FIO_WriteFile(f, b, n); FIO_CloseFile(f); }
     if (srmp_buf) { r_srm_free(srmp_buf, 0, 0); msleep(200); }   /* give the buffer back */
