@@ -1916,6 +1916,14 @@ static void srmprobe_task(void)
 {
     gui_stop_menu();
     msleep(300);
+    /* DIAGNOSE the SRM state machine: the alloc is gated by hStateObject (srmEventDispatch FUN_e04e333e ->
+     * FUN_e054ab10(stateobj,...) returns error unless the state accepts the event). ptr@0xE04E3390 = 0x5124 =
+     * &RscMgr; stateobj = *(RscMgr+8); GetCurrentState (FUN_e054ac1a) = *(stateobj+0x1c). */
+    uint32_t rscmgr = *(volatile uint32_t *)0x5124u;
+    uint32_t stateo = (rscmgr > 0x1000u && rscmgr < 0x40000000u) ? *(volatile uint32_t *)(rscmgr + 8) : 0;
+    uint32_t curst  = (stateo > 0x1000u && stateo < 0x40000000u) ? *(volatile uint32_t *)(stateo + 0x1c) : 0;
+    uint32_t st150  = (rscmgr > 0x1000u && rscmgr < 0x40000000u) ? *(volatile uint32_t *)(rscmgr + 0x150) : 0;
+    uint32_t signat = (stateo > 0x1000u && stateo < 0x40000000u) ? *(volatile uint32_t *)stateo : 0;
     void (*r_srm_alloc)(void *, void *)    = (void *)(0xE04E41BEu | 1);   /* names avoid the mem.h srm_* macros */
     void (*r_srm_free)(uint32_t, int, int) = (void *)(0xE04E7590u | 1);
     void * localbuf = 0;
@@ -1934,12 +1942,14 @@ static void srmprobe_task(void)
     int waited = 0;
     while (!srmp_done && waited < 3000) { msleep(20); waited += 20; }
     gui_uilock(icu_uilock & ~0x0001);                    /* unlock the shutter (we free the buffer below) */
-    char b[260]; int n = snprintf(b, sizeof(b),
+    char b[380]; int n = snprintf(b, sizeof(b),
         "SRM probe: done=%d buf=%08x size=%08x (%uMB) waited=%dms localbuf=%08x\n"
-        "done=1 & size>0 => SRM WORKS on R. Set SRM_BUFFER_SIZE=0x%x in consts.h, add the two stubs, drop\n"
-        "CONFIG_MEMORY_SRM_NOT_WORKING -> full 52MB stills stage + raw-video buffers.\n",
+        "SRM state machine: rscmgr=%08x stateobj=%08x sig=%08x curState=%d rscmgr+0x150=%d\n"
+        "(alloc gated by hStateObject; done=0 => curState rejects the alloc event, need ST_NORMAL_SRM.\n"
+        " done=1 & size>0 => SRM WORKS, SRM_BUFFER_SIZE=0x%x.)\n",
         srmp_done, (unsigned)srmp_buf, (unsigned)srmp_sz, (unsigned)(srmp_sz >> 20), waited,
-        (unsigned)(uintptr_t)localbuf, (unsigned)srmp_sz);
+        (unsigned)(uintptr_t)localbuf, (unsigned)rscmgr, (unsigned)stateo, (unsigned)signat,
+        (int)curst, (int)st150, (unsigned)srmp_sz);
     FILE * f = FIO_CreateFile("ML/LOGS/SRMPROBE.TXT");
     if (f) { FIO_WriteFile(f, b, n); FIO_CloseFile(f); }
     if (srmp_buf) { r_srm_free(srmp_buf, 0, 0); msleep(200); }   /* give the buffer back */
