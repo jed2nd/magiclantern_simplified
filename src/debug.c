@@ -1612,12 +1612,15 @@ static int rawhk_rawlv = 0;
 static int rawhk_dumpfull = 0;
 static int rawhk_stillgrab = 0;
 /* SOFTWARE SHUTTER: fire the capture ourselves (scripted -- no manual press) from a spawned task, so the grab
- * task can poll the +0xa0 hook concurrently and catch the buffers WHILE the shot is in progress.
- * lens_take_picture is the R's validated capture path (used by the intervalometer/bracketing). */
+ * task can read the live buffer WHILE the shot is in progress, then write it AFTER the shot frees the card.
+ * lens_take_picture is the R's validated capture path (used by the intervalometer/bracketing). sg_done lets the
+ * grab task know the photo (and its CR3 card write) has finished, so its own FIO writes won't collide with it. */
+static volatile int sg_done = 0;
 static void sg_shutter(void)
 {
     msleep(600);                            /* let the grab task settle into its poll loop first */
     lens_take_picture(64, AF_DONT_CHANGE);  /* fire one photo, leaving the camera's AF setting as-is */
+    sg_done = 1;
 }
 static void rawhk_task(void)
 {
@@ -1677,6 +1680,7 @@ static void rawhk_task(void)
          * (read the LIVE TTBR1 L1 entry; stop at the first unmapped supersection) so reads past 0xa3ffffff into
          * 0xa4.. can't fault. Records all idx24 +0xa0 addresses (rawhk_seq) = the per-strip layout for later
          * full-frame assembly. -> ML/LOGS/RWGF24.BIN (+ RWGF25.BIN) + STILLGRAB.TXT. */
+        sg_done = 0;
         task_create("sgshut", 0x1a, 0x2000, (void *)sg_shutter, 0);   /* fire the photo ourselves (scripted) */
         uint32_t ttbr1 = 0; asm volatile ("mrc p15, 0, %0, c2, c0, 1" : "=r"(ttbr1));
         uint32_t t1 = ttbr1 & ~0x3FFFu;
@@ -1692,17 +1696,36 @@ static void rawhk_task(void)
             if (h && h == last) { if (++stable >= 3) { quiesced = 1; break; } }   /* ~60ms no new idx24 write */
             else { stable = 0; last = h; }
         }
-        /* Grab ALL 0xD0487 channels: the full frame is SPLIT across them (Canon writes ~16MB pieces to different
-         * regions = the "rotation" hypothesis). Reading each channel's OWN buffer, capped to its 16MB
-         * supersection + MMU-checked, is crash-safe -- the earlier reboot was reading PAST idx24 into unbacked
-         * 0xa4 (no buffer there). Each -> RWF<idx>.BIN; first word logged so we see which stayed valid = the
-         * time budget for capturing the whole frame in one shot. Assemble RWF*.BIN into one frame offline. */
-        static const int chans[] = { 24, 25, 58, 59, 60, 61 };
         char tb[1600]; int tn = 0;
+        /* idx24 (a3, THE dual-pixel raw) is the priority AND its bank is WIPED to 0xAA at RELEASE, so read it into
+         * RAM NOW while live (right after DMA quiescence), THEN wait for the scripted shot to finish so the card is
+         * free -- the concurrent CR3 write blocks FIO_CreateFile (last run wrote 0 files), so we must defer our own
+         * writes until the camera releases the card. */
+        uint32_t a24 = rawhk_addr[24], got24 = 0, first24 = 0;
+        if (stg && a24)
+        {
+            uint32_t cp = a24 & ~0x40000000u, e = (cp & 0xFF000000u) + 0x01000000u, lim = stagesz;
+            if (e - cp < lim) lim = e - cp;
+            for (uint32_t o = 0; o < lim; o += 0x100000u)
+            {
+                if (!A3_MAPPED(cp + o)) break;
+                memcpy((uint8_t *)stg + o, (void *)UNCACHEABLE(cp + o), 0x100000u);
+                got24 = o + 0x100000u;
+            }
+            first24 = got24 ? *(volatile uint32_t *)stg : 0;
+        }
+        int w2 = 0; while (!sg_done && w2 < 12000) { msleep(50); w2 += 50; }
+        msleep(400);   /* let the camera finish the CR3 write + release the card */
+        { FILE * df = FIO_CreateFile("ML/LOGS/RWF24.BIN");
+          if (df) { for (uint32_t o = 0; o < got24; o += 0x10000u) FIO_WriteFile(df, (uint8_t *)stg + o, 0x10000u); FIO_CloseFile(df); } }
         tn += snprintf(tb + tn, sizeof(tb) - tn,
-            "FULL-FRAME grab (all d0487 chans, each capped to its supersection). waited=%dms q=%d stage=%uMB\n"
-            "first != aa/55 => caught live; assemble RWF*.BIN -> one dual-pixel frame:\n",
-            waited, quiesced, (unsigned)(stagesz >> 20));
+            "SCRIPTED grab. waited=%dms q=%d sg_done=%d w2=%dms stage=%uMB\n"
+            "idx24 a=%08x first=%08x got=%dMB hits=%d (read LIVE @quiescence, written after shot freed card)\n",
+            waited, quiesced, sg_done, w2, (unsigned)(stagesz >> 20),
+            (unsigned)a24, (unsigned)first24, (int)(got24 >> 20), (int)rawhk_hits[24]);
+        /* the OTHER channels now (card free). idx25/58 are imaging banks (may be wiped post-shot); idx59/60/61 are
+         * main RAM (persist). Each capped to its supersection + MMU-checked = crash-safe -> RWF<idx>.BIN. */
+        static const int chans[] = { 25, 58, 59, 60, 61 };
         for (unsigned ci = 0; ci < sizeof(chans) / sizeof(chans[0]); ci++)
         {
             int c = chans[ci];
