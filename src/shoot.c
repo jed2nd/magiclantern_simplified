@@ -260,14 +260,22 @@ static int get_lv_avg_luma(void)
 static int adaptive_exposure_step(void)
 {
     int avgY = get_lv_avg_luma();
-    if (avgY < 0) return -1;
-    int err = avgY - (int)adapt_target;        /* >0 too bright, <0 too dark */
-    if (err > -ADAPT_DEADBAND && err < ADAPT_DEADBAND) return avgY;   /* close enough -> hold */
-
+    if (avgY < 0)
+    {
+        /* no live image -> usually idle-powersave turned LiveView off between shots. Without a meter we
+         * can't ramp; the powersave is now suppressed while adaptive is on (see the intervalometer loop). */
+        bmp_printf(FONT_MED, 50, 340, "TL adapt: no LV image (keep LiveView on)   ");
+        return -1;
+    }
     if (adapt_cur_shutter < 0)
         adapt_cur_shutter = COERCE(lens_info.raw_shutter ? lens_info.raw_shutter : 112, (int)adapt_shutter_min, (int)adapt_shutter_max);
     if (adapt_cur_iso < 0)
         adapt_cur_iso = COERCE(lens_info.raw_iso ? lens_info.raw_iso : 72, (int)adapt_iso_min, (int)adapt_iso_max);
+
+    int err = avgY - (int)adapt_target;        /* >0 too bright, <0 too dark */
+    bmp_printf(FONT_MED, 50, 340, "TL adapt: Y=%d/%d err=%d shut=%d iso=%d   ",
+               avgY, (int)adapt_target, err, adapt_cur_shutter, adapt_cur_iso);
+    if (err > -ADAPT_DEADBAND && err < ADAPT_DEADBAND) return avgY;   /* close enough -> hold */
 
     int raw_step = COERCE(err / 12, -(int)adapt_max_step, (int)adapt_max_step);   /* +ve -> faster shutter (darker) */
     if (raw_step == 0) raw_step = (err > 0) ? 1 : -1;                             /* always cross the deadband */
@@ -6298,7 +6306,8 @@ shoot_task( void* unused )
                     exit_play_qr_mode();
                 }
 
-                if (lens_info.job_state == 0 && liveview_display_idle() && intervalometer_running && !display_turned_off)
+                if (lens_info.job_state == 0 && liveview_display_idle() && intervalometer_running && !display_turned_off
+                    && !adapt_exp_enabled)   /* adaptive timelapse needs LiveView live for the luma meter */
                 {
                     idle_force_powersave_now();
                     display_turned_off = 1; // ... but only once per picture (don't be too aggressive)
@@ -6360,8 +6369,9 @@ shoot_task( void* unused )
             auto_ettr_intervalometer_wait();
             module_exec_cbr(CBR_INTERVALOMETER);
             #endif
-            
-            idle_force_powersave_now();
+
+            if (!adapt_exp_enabled)   /* keep LiveView live between shots for the adaptive luma meter */
+                idle_force_powersave_now();
         }
         else // intervalometer not running
         #endif // FEATURE_INTERVALOMETER
