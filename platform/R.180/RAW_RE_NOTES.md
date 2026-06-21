@@ -539,3 +539,17 @@ CONCLUSION:
   rows (low-detail test scene). NEXT: detailed scene + full-frame grab (8 hits may = 8 strips) -> DNG; then the
   same hook/grab pattern for the LV-raw VIDEO path. The sec-18 "where/when/how + non-destructive intercept"
   question is ANSWERED for stills.
+
+### §19 CORRECTIONS (2026-06-21, subagent audit vs the Dual-Pixel finding) -- several RESULT claims above are WRONG
+- **GEOMETRY (corrected) = DUAL PIXEL RAW:** row = 13504 samples (A/B photodiodes INTERLEAVED per photosite,
+  ~6752 photosites incl pad), 14-bit MSB, **stride 23632 B** -- NOT 6720px/11760-11780. The "de-shear at 11780"
+  only aligned the FPN banding, not the scene. At 23632 the frame renders the kitchen clearly.
+- **"3369 even/odd delta = Bayer CFA" was WRONG:** it's the A/B photodiode DISPARITY (mean(A)<mean(B) in 100%
+  of rows). Bayer is plausible but the RGGB PATTERN/PHASE is UNVERIFIED (DNG color may need a phase fix).
+- **idx59/61 + idx25 are NOT noise:** they're MORE dual-pixel raw buffers of the SAME frame (peak @stride
+  23632, ~0.3 corr with idx24). idx60/RW60 = a descriptor/metadata buffer (peaks @stride 640).
+- **DROP "8 hits = strips":** the 8 +0xa0 addrs span only ~21KB (0xd90 apart), not the ~106MB frame -- they're
+  sub-line DMA pointer updates within one burst. Full-frame capture still needs SRM (or larger staging).
+- **DNG tooling FIXED** (eosr_port/dng_write.py mode "dp"): A+B is 15-bit -> WhiteLevel 32767 (the old
+  min(16383) clamp blew ~27% of highlights); BlackLevel ~60 (was 512). RWGF24.dng (kitchen) verified clean.
+- UNAFFECTED: LV idx2/30 geometry + the "video full-res raw = hard limit" conclusion.
