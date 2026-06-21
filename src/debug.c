@@ -708,7 +708,7 @@ static void from_region_dump_task()
  * (and whether each release even produces one). */
 static void capsig_probe_task()
 {
-    static char b[3800];
+    static char b[2600];
     int n = 0;
     gui_stop_menu(); msleep(800);
     n += snprintf(b + n, sizeof(b) - n, "Capture-signal probe (R) -- 3 shots via IR-remote\n");
