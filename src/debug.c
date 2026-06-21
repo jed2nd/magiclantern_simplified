@@ -1915,14 +1915,14 @@ static void srmprobe_task(void)
 {
     gui_stop_menu();
     msleep(300);
-    void (*srm_alloc)(void *, void *)      = (void *)(0xE04E41BEu | 1);
-    void (*srm_free)(uint32_t, int, int)   = (void *)(0xE04E7590u | 1);
+    void (*r_srm_alloc)(void *, void *)    = (void *)(0xE04E41BEu | 1);   /* names avoid the mem.h srm_* macros */
+    void (*r_srm_free)(uint32_t, int, int) = (void *)(0xE04E7590u | 1);
     void * localbuf = 0;
     void * cbrp = (void *)srmp_cbr;                       /* (void*) intermediate -> no cast-function-type */
     srmp_buf = 0; srmp_sz = 0; srmp_done = 0;
     NotifyBox(8000, "SRM probe: allocating via RscMgr...");
     beep();
-    srm_alloc(cbrp, &localbuf);                           /* async: RscMgr task will call srmp_cbr */
+    r_srm_alloc(cbrp, &localbuf);                         /* async: RscMgr task will call srmp_cbr */
     int waited = 0;
     while (!srmp_done && waited < 3000) { msleep(20); waited += 20; }
     char b[260]; int n = snprintf(b, sizeof(b),
@@ -1933,7 +1933,7 @@ static void srmprobe_task(void)
         (unsigned)(uintptr_t)localbuf, (unsigned)srmp_sz);
     FILE * f = FIO_CreateFile("ML/LOGS/SRMPROBE.TXT");
     if (f) { FIO_WriteFile(f, b, n); FIO_CloseFile(f); }
-    if (srmp_buf) { srm_free(srmp_buf, 0, 0); msleep(200); }   /* give the buffer back */
+    if (srmp_buf) { r_srm_free(srmp_buf, 0, 0); msleep(200); }   /* give the buffer back */
     NotifyBox(12000, "SRM probe: %uMB done=%d -> SRMPROBE.TXT", (unsigned)(srmp_sz >> 20), srmp_done);
 }
 
