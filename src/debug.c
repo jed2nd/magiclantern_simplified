@@ -1581,6 +1581,9 @@ static volatile uint32_t rawhk_addr[RAWHK_NCH];   /* last non-zero +0xa0 buffer 
 static volatile uint32_t rawhk_hits[RAWHK_NCH];   /* call count per channel */
 static volatile uint32_t rawhk_total;             /* all calls while patched -- proves the hook is live */
 static volatile int      rawhk_on;
+#define RAWHK_SEQ 12
+static volatile uint32_t rawhk_seq[RAWHK_SEQ];    /* every idx24 +0xa0 addr in order = the per-strip layout */
+static volatile int      rawhk_seqn;
 
 /* Replaces FUN_e05364b6 (a one-line leaf): *(DmacInfo[chan].pBlock + 0xa0) = addr.  r0=chan, r1=addr.
  * Log which channels get a buffer set + the addr (to find the RAW channel), then do the original write.
@@ -1598,6 +1601,7 @@ void rawhk_wrapper(uint32_t chan, uint32_t addr)
     {
         rawhk_hits[chan]++;
         if (addr) rawhk_addr[chan] = addr;                    /* keep last non-zero (teardown writes 0) */
+        if (chan == 24 && addr && rawhk_seqn < RAWHK_SEQ) rawhk_seq[rawhk_seqn++] = addr;   /* strip layout */
     }
     *(volatile uint32_t *)(pblock + 0xa0) = addr;             /* replicate FUN_e05364b6 */
 }
@@ -1616,7 +1620,7 @@ static void rawhk_task(void)
     int stillgrab = rawhk_stillgrab; rawhk_stillgrab = 0;
     if (rawlv && !lv) { NotifyBox(5000, "Raw-LV hook: enter LiveView first"); return; }
     for (int i = 0; i < RAWHK_NCH; i++) { rawhk_addr[i] = 0; rawhk_hits[i] = 0; }
-    rawhk_on = 0; rawhk_total = 0;
+    rawhk_on = 0; rawhk_total = 0; rawhk_seqn = 0;
 
     /* runtime-hook FUN_e05364b6 @0xE05364B6 (page 0xE0530000 -- needs the MMU 2-page bump).
      * orig 8 bytes: 88 4a (ldr r2,[pc,..]); 52 f8 30 00 (ldr.w); c0 f8 (str.w r1,[r0,#0xa0]). */
@@ -1657,49 +1661,66 @@ static void rawhk_task(void)
     beep();
     if (stillgrab)
     {
-        /* TIMED LIVE GRAB of the transient stills raw (idx24 @0xa3xxxxxx). The 0xa3 supersection is STATICALLY
-         * mapped (reading never faults -- A3 probe), but the raw is present only DURING the shot, cleared to
-         * 0xAA after. So poll until idx24's +0xa0 write-burst goes quiet (~60ms with no new hit = DMA done),
-         * then immediately memcpy the buffer to RAM staging (fast -- beats Canon's clear) and write it out.
-         * first word != aa../55.. => we caught the live raw; == => already cleared -> escalate to a completion
-         * CBR. idx25 grabbed too (bonus). -> ML/LOGS/RWG24.BIN, RWG25.BIN, STILLGRAB.TXT. */
-        void * stg = fio_malloc(0x400000u);
-        int waited = 0, stable = 0; uint32_t last = 0, got = 0;
+        /* TIMED LIVE FULL-FRAME GRAB of the transient stills raw (idx24 @0xa3xxxxxx). The 0xa3 supersection is
+         * STATICALLY mapped (reading never faults), but the raw is present only DURING the shot, cleared to 0xAA
+         * after. Poll until idx24's +0xa0 burst goes quiet (~60ms no new hit = DMA done), then grab the buffer
+         * into the largest RAM stage the R allows. SRM is DISABLED on R (CONFIG_MEMORY_SRM_NOT_WORKING) so the
+         * full ~52MB frame can't be staged -> grab up to 16MB (top ~1400 of 4480 rows). MMU-checked 1MB chunks
+         * (read the LIVE TTBR1 L1 entry; stop at the first unmapped supersection) so reads past 0xa3ffffff into
+         * 0xa4.. can't fault. Records all idx24 +0xa0 addresses (rawhk_seq) = the per-strip layout for later
+         * full-frame assembly. -> ML/LOGS/RWGF24.BIN (+ RWGF25.BIN) + STILLGRAB.TXT. */
+        uint32_t ttbr1 = 0; asm volatile ("mrc p15, 0, %0, c2, c0, 1" : "=r"(ttbr1));
+        uint32_t t1 = ttbr1 & ~0x3FFFu;
+#define A3_MAPPED(va) ((*(volatile uint32_t *)(t1 + (((va) >> 20) << 2)) & 3u) != 0u)
+        uint32_t stagesz = 0x1000000u;                 /* 16MB; must stay < 20MB (SRM off) */
+        void * stg = 0;
+        while (stagesz >= 0x400000u) { stg = fio_malloc(stagesz); if (stg) break; stagesz >>= 1; }
+        int waited = 0, stable = 0, quiesced = 0; uint32_t last = 0;
         while (waited < 15000)
         {
             msleep(20); waited += 20;
             uint32_t h = rawhk_hits[24];
-            if (h && h == last) { if (++stable >= 3) { got = 1; break; } }   /* ~60ms no new idx24 write */
+            if (h && h == last) { if (++stable >= 3) { quiesced = 1; break; } }   /* ~60ms no new idx24 write */
             else { stable = 0; last = h; }
         }
-        uint32_t a24 = rawhk_addr[24], a25 = rawhk_addr[25], f24 = 0, f25 = 0;
+        uint32_t a24 = rawhk_addr[24], a25 = rawhk_addr[25], f24 = 0, f25 = 0, got = 0;
         if (stg && a24)
         {
-            memcpy(stg, (void *)UNCACHEABLE(a24 & ~0x40000000u), 0x400000u);   /* grab NOW, before the clear */
+            uint32_t cp = a24 & ~0x40000000u;
+            for (uint32_t o = 0; o < stagesz; o += 0x100000u)        /* fast MMU-checked grab -- beats the clear */
+            {
+                if (!A3_MAPPED(cp + o)) break;
+                memcpy((uint8_t *)stg + o, (void *)UNCACHEABLE(cp + o), 0x100000u);
+                got = o + 0x100000u;
+            }
             f24 = *(volatile uint32_t *)stg;
-            FILE * df = FIO_CreateFile("ML/LOGS/RWG24.BIN");
-            if (df) { for (uint32_t o = 0; o < 0x400000u; o += 0x10000u) FIO_WriteFile(df, (uint8_t *)stg + o, 0x10000u); FIO_CloseFile(df); }
+            FILE * df = FIO_CreateFile("ML/LOGS/RWGF24.BIN");
+            if (df) { for (uint32_t o = 0; o < got; o += 0x10000u) FIO_WriteFile(df, (uint8_t *)stg + o, 0x10000u); FIO_CloseFile(df); }
         }
-        if (stg && a25)
+        if (stg && a25)                                              /* idx25 (2nd DPRAW plane) -- 4MB reference */
         {
-            memcpy(stg, (void *)UNCACHEABLE(a25 & ~0x40000000u), 0x400000u);
+            uint32_t cp = a25 & ~0x40000000u, g = 0;
+            for (uint32_t o = 0; o < 0x400000u; o += 0x100000u) { if (!A3_MAPPED(cp + o)) break; memcpy((uint8_t *)stg + o, (void *)UNCACHEABLE(cp + o), 0x100000u); g = o + 0x100000u; }
             f25 = *(volatile uint32_t *)stg;
-            FILE * df = FIO_CreateFile("ML/LOGS/RWG25.BIN");
-            if (df) { for (uint32_t o = 0; o < 0x400000u; o += 0x10000u) FIO_WriteFile(df, (uint8_t *)stg + o, 0x10000u); FIO_CloseFile(df); }
+            FILE * df = FIO_CreateFile("ML/LOGS/RWGF25.BIN");
+            if (df) { for (uint32_t o = 0; o < g; o += 0x10000u) FIO_WriteFile(df, (uint8_t *)stg + o, 0x10000u); FIO_CloseFile(df); }
         }
         if (stg) fio_free(stg);
-        char tb[300]; int tn = 0;
+#undef A3_MAPPED
+        char tb[440]; int tn = 0;
         tn += snprintf(tb + tn, sizeof(tb) - tn,
-            "stillgrab idx24 hits=%d a0=%08x first=%08x | idx25 hits=%d a0=%08x first=%08x | waited=%dms got=%d\n"
-            "first != aaaaaaaa/55555555 => caught LIVE raw; == clear-fill => need a completion CBR.\n",
-            (int)rawhk_hits[24], (unsigned)a24, (unsigned)f24,
-            (int)rawhk_hits[25], (unsigned)a25, (unsigned)f25, waited, (unsigned)got);
+            "stillgrab FULL: idx24 hits=%d a0=%08x first=%08x staged=%uMB(stage %uMB) | idx25 a0=%08x first=%08x | waited=%dms q=%d\n",
+            (int)rawhk_hits[24], (unsigned)a24, (unsigned)f24, (unsigned)(got >> 20), (unsigned)(stagesz >> 20),
+            (unsigned)a25, (unsigned)f25, waited, quiesced);
+        tn += snprintf(tb + tn, sizeof(tb) - tn, "idx24 seq(n=%d):", (int)rawhk_seqn);
+        for (int k = 0; k < rawhk_seqn && k < RAWHK_SEQ; k++) tn += snprintf(tb + tn, sizeof(tb) - tn, " %08x", (unsigned)rawhk_seq[k]);
+        tn += snprintf(tb + tn, sizeof(tb) - tn, "\nfirst != aa/55 => live raw; seq = per-strip buffer addrs (for full-frame assembly).\n");
         FILE * tf = FIO_CreateFile("ML/LOGS/STILLGRAB.TXT");
         if (tf) { FIO_WriteFile(tf, tb, tn); FIO_CloseFile(tf); }
         msleep(300);
         rawhk_on = 0; msleep(50);
         unpatch_memory(0xE05364B6);
-        NotifyBox(13000, "Stills grab: idx24 hits=%d got=%d f=%08x -> RWG24.BIN", (int)rawhk_hits[24], (int)got, (unsigned)f24);
+        NotifyBox(13000, "Stills grab: %uMB staged f=%08x -> RWGF24.BIN", (unsigned)(got >> 20), (unsigned)f24);
         return;
     }
     msleep(7000);   /* let every channel populate (raw LV or recording) */
