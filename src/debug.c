@@ -1676,10 +1676,13 @@ static void rawhk_task(void)
     }
     if (dumpfull)
     {
-        /* dump FULL 4MB buffers of the scene-showing high-corr + widest channels -> ML/LOGS/RWxx.BIN.
-         * (idx30 showed the actual scene; hunt the one with Bayer mosaic = the raw.) Buffers live (raw on).
-         * a0 comes from the hook ARG (RAM), so faulting-region channels (d04a2: 30/64/69) are fine to read. */
-        static const int cand[] = {2, 30, 19, 64, 69, 8};
+        /* dump FULL 4MB buffers of the candidate channels -> ML/LOGS/RWxx.BIN. For the STILLS raw, take a
+         * PHOTO (image quality RAW + Canon Dual Pixel RAW ON) during the window: the 0xD0487 still-capture
+         * channels light up. idx59/60/61 (a0 0x6x/0x7x) are in the readable uncached-RAM window and get
+         * dumped; idx24/25 (a0 0xa0xxxxxx) are ABOVE it -> SKIPPED by the address filter (cp>=0x60000000)
+         * until the MMU walk confirms their alias (their a0 is still logged in RAWHK.TXT). a0 comes from the
+         * hook ARG (RAM), so faulting-region channels read fine via the arg. */
+        static const int cand[] = {59, 60, 61, 24, 25, 2};
         for (unsigned ci = 0; ci < sizeof(cand) / sizeof(cand[0]); ci++)
         {
             int c = cand[ci];
