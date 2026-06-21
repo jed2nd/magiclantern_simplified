@@ -1666,10 +1666,10 @@ static void rawhk_task(void)
             if (!rawhk_hits[c]) continue;
             uint32_t a0 = rawhk_addr[c];
             uint32_t cp = a0 & ~0x40000000u;
-            /* SAFE window only. Reading idx24/25 @0xa0xxxxxx FAULTED (the e0000000 ROM master table claimed it
-             * mapped, but the LIVE TTBR1 table -- TTBCR.N=7 routes high VAs there -- is the real authority; the
-             * "MMU walk" probe now reads it. Re-enable 0xa0... only once the live walk confirms the mapping. */
-            if (cp < 0x01000000u || cp >= 0x60000000u) continue;
+            /* A3 PROBE CONFIRMED 0xa0/0xa3 are CPU-readable (mapped 16MB supersections, AP=1; 0xAA fill at idle).
+             * Allow up to 0xc0000000 so idx24/25 (the stills-raw bank) snapshot too. CAVEAT: this runs ~7s after
+             * the shot, so the transient buffer may be cleared to 0xAA by now -- live capture is the hook path. */
+            if (cp < 0x01000000u || cp >= 0xc0000000u) continue;
             uint32_t * hdr = (uint32_t *)((uint8_t *)blob + bn);
             hdr[0] = 0x52415748u; hdr[1] = (uint32_t)c; hdr[2] = a0; hdr[3] = 0x20000u;   /* magic,idx,a0,len */
             bn += 16;
@@ -1679,19 +1679,18 @@ static void rawhk_task(void)
     }
     if (dumpfull)
     {
-        /* dump FULL 4MB buffers of the candidate channels -> ML/LOGS/RWxx.BIN. For the STILLS raw, take a
-         * PHOTO (image quality RAW + Canon Dual Pixel RAW ON) during the window: the 0xD0487 still-capture
-         * channels light up. idx59/60/61 (a0 0x6x/0x7x) are in the readable uncached-RAM window and get
-         * dumped; idx24/25 (a0 0xa0xxxxxx) are ABOVE it -> SKIPPED by the address filter (cp>=0x60000000)
-         * until the MMU walk confirms their alias (their a0 is still logged in RAWHK.TXT). a0 comes from the
-         * hook ARG (RAM), so faulting-region channels read fine via the arg. */
-        static const int cand[] = {59, 60, 61, 2, 24, 25};   /* 24/25 (0xa0... = prime stills raw) LAST -- saved-first safety */
+        /* dump FULL 4MB buffers of the candidate channels -> ML/LOGS/RWxx.BIN. STILLS raw: take a PHOTO (RAW +
+         * Canon Dual Pixel RAW ON) during the window -> the 0xD0487 chans light up. idx24/25 (a0=0xa0/0xa3) are
+         * the prime raw; the A3 probe proved that bank is CPU-readable, so allow up to 0xc0000000. CAVEAT: this
+         * dump is ~7s post-shot -> idx24/25 may read 0xAA clear-fill (transient buffer). The reliable live grab
+         * is the hook-staged copy (rawhk_wrapper / stillgrab). a0 comes from the hook ARG (RAM). */
+        static const int cand[] = {59, 60, 61, 2, 24, 25};   /* 24/25 (0xa0/0xa3 = prime stills raw) LAST -- saved-first safety */
         for (unsigned ci = 0; ci < sizeof(cand) / sizeof(cand[0]); ci++)
         {
             int c = cand[ci];
             if (c >= RAWHK_NCH || !rawhk_hits[c]) continue;
             uint32_t cp = rawhk_addr[c] & ~0x40000000u;
-            if (cp < 0x01000000u || cp >= 0x60000000u) continue;
+            if (cp < 0x01000000u || cp >= 0xc0000000u) continue;
             char nm[32]; snprintf(nm, sizeof(nm), "ML/LOGS/RW%d.BIN", c);
             FILE * df = FIO_CreateFile(nm);
             if (df) { for (uint32_t o = 0; o < 0x400000u; o += 0x10000u) FIO_WriteFile(df, (void *)UNCACHEABLE(cp + o), 0x10000u); FIO_CloseFile(df); }
