@@ -1967,26 +1967,22 @@ static void srmregions_task(void)
 {
     gui_stop_menu();
     msleep(300);
-    int (*r_count)(int, uint32_t)     = (void *)(0xE044FC42u | 1);   /* FUN_e044fc42(area,-1) = count */
     int (*r_addr)(uint32_t, uint32_t) = (void *)(0xE044F576u | 1);   /* FUN_e044f576(area,idx) = address */
     int (*r_size)(int, uint32_t)      = (void *)(0xE044F7E8u | 1);   /* FUN_e044f7e8(area,idx) = size */
-    static const int areas[] = { 4, 5 };
+    /* Curated SAFE areas (the size fn FUN_e044f7e8 returns a value, no "isn't Exist" assert): 4/5 = SRM video
+     * pool, 0x2c/0x53/0x55 = 76MB (0x4c00000) pools = the full-frame lead, 0x2d/0x54/0x56 = PlayBack. addr=0 =>
+     * configured but not allocated now; a big NON-ZERO addr => a large buffer we may grab into directly. */
+    static const int areas[] = { 4, 5, 0x2c, 0x2d, 0x53, 0x54, 0x55, 0x56 };
     char b[760]; int n = 0;
-    n += snprintf(b + n, sizeof(b) - n, "SRM region pool (areas 4,5 from the RscMgr init):\n");
-    for (unsigned a = 0; a < 2; a++)
+    n += snprintf(b + n, sizeof(b) - n, "Memory AREA scan (idx0 addr+size). big+allocated = full-frame buffer:\n");
+    for (unsigned a = 0; a < sizeof(areas) / sizeof(areas[0]); a++)
     {
         int area = areas[a];
-        int cnt = r_count(area, 0xffffffffu);
-        n += snprintf(b + n, sizeof(b) - n, "area %d: count=%d\n", area, cnt);
-        for (int i = 0; i < cnt && i < 8; i++)
-        {
-            uint32_t ad = (uint32_t)r_addr((uint32_t)area, (uint32_t)i);
-            uint32_t sz = (uint32_t)r_size(area, (uint32_t)i);
-            n += snprintf(b + n, sizeof(b) - n, "  [%d] addr=%08x size=%08x (%uMB)\n",
-                          i, (unsigned)ad, (unsigned)sz, (unsigned)(sz >> 20));
-        }
+        uint32_t ad = (uint32_t)r_addr((uint32_t)area, 0);
+        uint32_t sz = (uint32_t)r_size(area, 0);
+        n += snprintf(b + n, sizeof(b) - n, "area 0x%02x: addr=%08x size=%08x (%dMB)\n",
+                      area, (unsigned)ad, (unsigned)sz, (int)(sz >> 20));
     }
-    n += snprintf(b + n, sizeof(b) - n, "big regions => SRM pool exists (usable directly); empty => no SRM mem.\n");
     FILE * f = FIO_CreateFile("ML/LOGS/SRMREGIONS.TXT");
     if (f) { FIO_WriteFile(f, b, n); FIO_CloseFile(f); }
     NotifyBox(12000, "SRM regions -> SRMREGIONS.TXT");
@@ -2666,11 +2662,11 @@ static struct menu_entry debug_menus[] = {
         .help2 = "Yields SRM_BUFFER_SIZE so we can enable SRM (full 52MB stills + raw video). -> SRMPROBE.TXT.",
     },
     {
-        .name        = "SRM regions",
+        .name        = "Area scan",
         .priv        = srmregions_task,
         .select      = run_in_separate_task,
-        .help  = "Enumerates the SRM memory pool (areas 4/5) directly: count + addr + size of each region.",
-        .help2 = "Big regions = SRM pool exists (usable directly, bypass the allocator). -> SRMREGIONS.TXT.",
+        .help  = "Scans Canon memory areas (4/5=SRM, 0x2c/0x53/0x55=76MB pools, 0x2d/54/56=PlayBack): addr+size.",
+        .help2 = "Finds a big ALLOCATED buffer to grab the full frame into directly (bypass SRM). -> SRMREGIONS.TXT.",
     },
     {
         .name        = "Raw bright test",
