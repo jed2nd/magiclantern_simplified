@@ -1666,11 +1666,10 @@ static void rawhk_task(void)
             if (!rawhk_hits[c]) continue;
             uint32_t a0 = rawhk_addr[c];
             uint32_t cp = a0 & ~0x40000000u;
-            /* MMU walk (MMU.TXT) confirmed 0xa0000000+ is identity-mapped, uncached, priv-RW -> the stills-raw
-             * buffers (idx24/25 @0xa0xxxxxx) read directly (UNCACHEABLE is a no-op there). Allow up to
-             * 0xc0000000 (excludes 0xC0/0xD0 MMIO + 0xE0 ROM). The 0x4x-0x7x window still round-trips via the
-             * 0x40000000 alias. The raw buffer is one contiguous >4MB allocation, so a 4MB read stays in it. */
-            if (cp < 0x01000000u || cp >= 0xc0000000u) continue;
+            /* SAFE window only. Reading idx24/25 @0xa0xxxxxx FAULTED (the e0000000 ROM master table claimed it
+             * mapped, but the LIVE TTBR1 table -- TTBCR.N=7 routes high VAs there -- is the real authority; the
+             * "MMU walk" probe now reads it. Re-enable 0xa0... only once the live walk confirms the mapping. */
+            if (cp < 0x01000000u || cp >= 0x60000000u) continue;
             uint32_t * hdr = (uint32_t *)((uint8_t *)blob + bn);
             hdr[0] = 0x52415748u; hdr[1] = (uint32_t)c; hdr[2] = a0; hdr[3] = 0x20000u;   /* magic,idx,a0,len */
             bn += 16;
@@ -1759,27 +1758,32 @@ static void mmu_walk_task(void)
     asm volatile ("mrc p15, 0, %0, c2, c0, 0" : "=r"(ttbr0));
     asm volatile ("mrc p15, 0, %0, c2, c0, 1" : "=r"(ttbr1));
     asm volatile ("mrc p15, 0, %0, c2, c0, 2" : "=r"(ttbcr));
-    uint32_t l1 = ttbr0 & ~0x3FFFu;
+    /* TTBCR.N splits the VA: addrs < split use TTBR0, >= split use TTBR1 (the LIVE high-mem table). */
+    uint32_t nbits = ttbcr & 7;
+    uint32_t split = nbits ? (1u << (32 - nbits)) : 0xffffffffu;
+    uint32_t t0 = ttbr0 & ~0x3FFFu, t1 = ttbr1 & ~0x3FFFu;
 
-    static const uint32_t addrs[] = {
-        0x00000000u, 0x00100000u, 0x40000000u, 0x62000000u, 0x76000000u,
-        0x80000000u, 0xa0000000u, 0xa3200000u, 0x23200000u, 0xe0000000u
+    static const uint32_t addrs[] = {                 /* focus on the stills-raw buffer regions */
+        0x00100000u, 0x40000000u, 0x62000000u, 0x76e00000u,
+        0xa0000000u, 0xa0100000u, 0xa3000000u, 0xa3200000u, 0xa3300000u, 0xa3500000u, 0xa3700000u
     };
-    char b[1024]; int n = 0;
+    char b[1100]; int n = 0;
     n += snprintf(b + n, sizeof(b) - n,
-        "TTBR0=%08x TTBR1=%08x TTBCR=%08x -> L1base=%08x (ML const CANON_ORIG=e0000000)\n"
-        "addr      L1@TTBR0  type  physbase  C B TEX | L1@e0000000\n",
-        (unsigned)ttbr0, (unsigned)ttbr1, (unsigned)ttbcr, (unsigned)l1);
+        "TTBR0=%08x TTBR1=%08x TTBCR=%08x split=%08x (<split=TTBR0, >=split=TTBR1; this reads the LIVE table)\n"
+        "addr      L1live    type  physbase  AP CB TEX which\n",
+        (unsigned)ttbr0, (unsigned)ttbr1, (unsigned)ttbcr, (unsigned)split);
     for (unsigned i = 0; i < sizeof(addrs) / sizeof(addrs[0]); i++)
     {
         uint32_t a = addrs[i];
-        uint32_t e  = *(volatile uint32_t *)(l1 + ((a >> 20) << 2));            /* live table (TTBR0) */
-        uint32_t ec = *(volatile uint32_t *)(0xe0000000u + ((a >> 20) << 2));   /* the ML-const table (compare) */
+        uint32_t tbl = (a < split) ? t0 : t1;
+        uint32_t e  = *(volatile uint32_t *)(tbl + ((a >> 20) << 2));    /* LIVE L1 entry (per the split) */
         int type = e & 3;
         const char * ts = type == 0 ? "FAULT" : type == 1 ? "L2pt" : type == 2 ? "SECT" : "SSEC";
-        n += snprintf(b + n, sizeof(b) - n, "%08x  %08x  %-5s %08x  %d %d %d | %08x\n",
-                      (unsigned)a, (unsigned)e, ts, (unsigned)(e & 0xFFF00000u),
-                      (int)((e >> 3) & 1), (int)((e >> 2) & 1), (int)((e >> 12) & 7), (unsigned)ec);
+        int ap = (int)((((e >> 15) & 1) << 2) | ((e >> 10) & 3));
+        n += snprintf(b + n, sizeof(b) - n, "%08x  %08x  %-5s %08x  %d  %d%d %d  %s\n",
+                      (unsigned)a, (unsigned)e, ts, (unsigned)(e & 0xFFF00000u), ap,
+                      (int)((e >> 3) & 1), (int)((e >> 2) & 1), (int)((e >> 12) & 7),
+                      (a < split) ? "TTBR0" : "TTBR1");
     }
     FILE * f = FIO_CreateFile("ML/LOGS/MMU.TXT");
     if (f) { FIO_WriteFile(f, b, n); FIO_CloseFile(f); }
