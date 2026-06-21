@@ -1738,6 +1738,47 @@ static void rawlv_dump_task(void) { rawhk_rawlv = 1; rawhk_dumpfull = 1; rawhk_t
  * commandeering, no StartEDmac (which hangs), so it can't lock up. -> RAWHK.TXT (+ dpraw chan hint) + RWxx.BIN. */
 static void rec_dump_task(void) { rawhk_dumpfull = 1; rawhk_task(); }
 
+/* "MMU walk": read the LIVE MMU L1 translation table (hardware ground truth) to map key address regions.
+ * Resolves whether 0xa0000000 (the stills-raw buffers idx24/25) is mapped + its cache attrs / cached twin,
+ * WITHOUT dereferencing 0xa0000000 itself (we only read the L1 table, which is RAM). Reads the REAL TTBR0
+ * (the ML const CANON_ORIG_MMU_TABLE_ADDR=0xe0000000 is the ROM base = suspect; we compare against it).
+ * ARMv7 short descriptor: entry bits[1:0] = 0b00 fault / 0b01 L2 ptr / 0b10 section; section phys base =
+ * &0xFFF00000, C=bit3 B=bit2 TEX=bits[14:12]. -> ML/LOGS/MMU.TXT. */
+static void mmu_walk_task(void)
+{
+    gui_stop_menu();
+    msleep(300);
+    uint32_t ttbr0 = 0, ttbr1 = 0, ttbcr = 0;
+    asm volatile ("mrc p15, 0, %0, c2, c0, 0" : "=r"(ttbr0));
+    asm volatile ("mrc p15, 0, %0, c2, c0, 1" : "=r"(ttbr1));
+    asm volatile ("mrc p15, 0, %0, c2, c0, 2" : "=r"(ttbcr));
+    uint32_t l1 = ttbr0 & ~0x3FFFu;
+
+    static const uint32_t addrs[] = {
+        0x00000000u, 0x00100000u, 0x40000000u, 0x62000000u, 0x76000000u,
+        0x80000000u, 0xa0000000u, 0xa3200000u, 0x23200000u, 0xe0000000u
+    };
+    char b[1024]; int n = 0;
+    n += snprintf(b + n, sizeof(b) - n,
+        "TTBR0=%08x TTBR1=%08x TTBCR=%08x -> L1base=%08x (ML const CANON_ORIG=e0000000)\n"
+        "addr      L1@TTBR0  type  physbase  C B TEX | L1@e0000000\n",
+        (unsigned)ttbr0, (unsigned)ttbr1, (unsigned)ttbcr, (unsigned)l1);
+    for (unsigned i = 0; i < sizeof(addrs) / sizeof(addrs[0]); i++)
+    {
+        uint32_t a = addrs[i];
+        uint32_t e  = *(volatile uint32_t *)(l1 + ((a >> 20) << 2));            /* live table (TTBR0) */
+        uint32_t ec = *(volatile uint32_t *)(0xe0000000u + ((a >> 20) << 2));   /* the ML-const table (compare) */
+        int type = e & 3;
+        const char * ts = type == 0 ? "FAULT" : type == 1 ? "L2pt" : type == 2 ? "SECT" : "SSEC";
+        n += snprintf(b + n, sizeof(b) - n, "%08x  %08x  %-5s %08x  %d %d %d | %08x\n",
+                      (unsigned)a, (unsigned)e, ts, (unsigned)(e & 0xFFF00000u),
+                      (int)((e >> 3) & 1), (int)((e >> 2) & 1), (int)((e >> 12) & 7), (unsigned)ec);
+    }
+    FILE * f = FIO_CreateFile("ML/LOGS/MMU.TXT");
+    if (f) { FIO_WriteFile(f, b, n); FIO_CloseFile(f); }
+    NotifyBox(9000, "MMU walk -> MMU.TXT (TTBR0=%08x)", (unsigned)ttbr0);
+}
+
 /* ---- EXPERIMENTAL SLURP (Debug -> "Slurp raw").  Pull the sensor 14-bit raw into OUR buffer the
  * mlv_lite way: commandeer a FREE write EDMAC channel and connect it to the sensor raw SOURCE
  * (connection 0 -- qemu-eos engine.c: conn 0/35 = sensor 14-bit raw; raw_width=xb*8/14, raw_height=yb+1,
@@ -2684,6 +2725,13 @@ static struct menu_entry debug_menus[] = {
         .select      = run_in_separate_task,
         .help  = "Select, then press REC + RECORD ~12s: hook + dump full buffers during H264 (Dpraw path).",
         .help2 = "Reads Canon's own raw (no commandeer/StartEDmac=no hang). -> RAWHK.TXT + RWxx.BIN.",
+    },
+    {
+        .name        = "MMU walk",
+        .priv        = mmu_walk_task,
+        .select      = run_in_separate_task,
+        .help  = "Reads the live MMU L1 table to map key regions (is 0xa0000000 mapped? cached twin?).",
+        .help2 = "Safe: only reads the L1 table (RAM), never 0xa0000000. -> ML/LOGS/MMU.TXT.",
     },
     {
         .name        = "Slurp raw",
