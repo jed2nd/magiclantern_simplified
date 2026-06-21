@@ -1994,6 +1994,25 @@ static void srmregions_task(void)
     NotifyBox(12000, "Area scan done (all OK) -> SRMREGIONS.TXT");
 }
 
+/* ---- DUMP 0x60000000 (Debug -> "Dump 0x60M").  The Area scan found areas 0x2c/0x53/0x55 = 76MB each, all
+ * based at 0x60000000 -- a large CPU-accessible region (uncached 0x4x-0x7x window, proven readable). Sample it
+ * to learn what it is: run right AFTER a RAW + Dual Pixel RAW photo. If it renders as the scene -> it's the
+ * full-res image buffer (76MB = our full-frame grab target). If 0xAA/zeros -> free staging. Else -> Canon work
+ * memory. Read-only (safe). first word logged first as a readability check. -> ML/LOGS/D60.BIN (8MB) + D60.TXT */
+static void dump60_task(void)
+{
+    gui_stop_menu();
+    msleep(300);
+    uint32_t first = *(volatile uint32_t *)0x60000000u;
+    char m[96]; int mn = snprintf(m, sizeof(m), "0x60000000: first=%08x [%08x %08x %08x] dumping 8MB...\n",
+        (unsigned)first, (unsigned)*(volatile uint32_t *)0x60000004u,
+        (unsigned)*(volatile uint32_t *)0x60000008u, (unsigned)*(volatile uint32_t *)0x6000000cu);
+    FILE * mf = FIO_CreateFile("ML/LOGS/D60.TXT"); if (mf) { FIO_WriteFile(mf, m, mn); FIO_CloseFile(mf); }
+    FILE * f = FIO_CreateFile("ML/LOGS/D60.BIN");
+    if (f) { for (uint32_t o = 0; o < 0x800000u; o += 0x10000u) FIO_WriteFile(f, (void *)(0x60000000u + o), 0x10000u); FIO_CloseFile(f); }
+    NotifyBox(9000, "0x60000000 first=%08x -> D60.BIN", (unsigned)first);
+}
+
 /* ---- RAW BRIGHTNESS + SCREEN-SLEEP TEST (Debug -> "Raw bright test").
  * We found the LV raw write channel: DmacInfo Port 14 = pBlock 0xD0440000, buffer-pointer reg at
  * +0x50, content = uncompressed Bayer. This averages that buffer over ~80s while logging a checksum,
@@ -2673,6 +2692,13 @@ static struct menu_entry debug_menus[] = {
         .select      = run_in_separate_task,
         .help  = "Scans Canon memory areas (4/5=SRM, 0x2c/0x53/0x55=76MB pools, 0x2d/54/56=PlayBack): addr+size.",
         .help2 = "Finds a big ALLOCATED buffer to grab the full frame into directly (bypass SRM). -> SRMREGIONS.TXT.",
+    },
+    {
+        .name        = "Dump 0x60M",
+        .priv        = dump60_task,
+        .select      = run_in_separate_task,
+        .help  = "Dumps 8MB of the 76MB region @0x60000000. Run right AFTER a RAW+DPRAW photo.",
+        .help2 = "Tells us if it's the full-res image buffer / free staging / Canon mem. -> D60.BIN + D60.TXT.",
     },
     {
         .name        = "Raw bright test",
