@@ -1790,6 +1790,38 @@ static void mmu_walk_task(void)
     NotifyBox(9000, "MMU walk -> MMU.TXT (TTBR0=%08x)", (unsigned)ttbr0);
 }
 
+/* ---- A3 READ PROBE (Debug -> "Probe a3 rd").  The live walk shows the stills-raw region 0xa0/0xa3 as
+ * MMU-mapped 16MB supersections (AP=1, identity) -- YET reading idx24 @0xa32df198 FAULTED, while idx59
+ * @0x76eea878 (SAME supersection type) read fine. Decide between two hypotheses:
+ *   (A) 0xa3000000 is a CPU-bus-blocked imaging-DRAM bank (external abort) -> need a DMA copy to read it; or
+ *   (B) the bank IS CPU-readable and the earlier fault was just the transient photo buffer freed after the shot.
+ * Staged crash-test: build a running log + flush it (truncating) BEFORE each fixed-address read. Controls
+ * 0x40/0x76 must pass (proves the probe works); then 0xa0/0xa3 are the question. If the camera SURVIVES, the
+ * bank is CPU-readable at idle -> (B), timing. If it CRASHES, the log's last (no-OK) line names the address
+ * that aborted -> (A), a hard CPU-bus wall. Menu-invoked = recoverable. -> ML/LOGS/A3PROBE.TXT */
+static void a3probe_task(void)
+{
+    gui_stop_menu();
+    msleep(300);
+    static const uint32_t pa[] = { 0x40000000u, 0x76000000u, 0xa0000000u, 0xa3000000u, 0xa3200000u };
+    char b[768]; int n = 0;
+    n += snprintf(b + n, sizeof(b) - n, "A3 read probe (controls 40/76 must pass; a0/a3 = the test)\n");
+    for (unsigned i = 0; i < sizeof(pa) / sizeof(pa[0]); i++)
+    {
+        uint32_t a = pa[i];
+        n += snprintf(b + n, sizeof(b) - n, "%08x: reading...", (unsigned)a);
+        FILE * f0 = FIO_CreateFile("ML/LOGS/A3PROBE.TXT");        /* flush BEFORE the read -> a crash pins the culprit */
+        if (f0) { FIO_WriteFile(f0, b, n); FIO_CloseFile(f0); }
+        NotifyBox(1200, "a3probe: reading %08x", (unsigned)a);
+        msleep(700);
+        uint32_t v0 = *(volatile uint32_t *)a;                   /* <-- may external-abort if CPU-bus-blocked */
+        uint32_t v1 = *(volatile uint32_t *)(a + 0x100000u);     /* +1MB, still inside the 16MB supersection */
+        n += snprintf(b + n, sizeof(b) - n, " OK %08x %08x\n", (unsigned)v0, (unsigned)v1);
+    }
+    FILE * f = FIO_CreateFile("ML/LOGS/A3PROBE.TXT");
+    if (f) { FIO_WriteFile(f, b, n); FIO_CloseFile(f); }
+    NotifyBox(9000, "a3probe: ALL reads survived -> A3PROBE.TXT (bank is CPU-readable)");
+}
 
 /* ---- RAW BRIGHTNESS + SCREEN-SLEEP TEST (Debug -> "Raw bright test").
  * We found the LV raw write channel: DmacInfo Port 14 = pBlock 0xD0440000, buffer-pointer reg at
@@ -2442,6 +2474,13 @@ static struct menu_entry debug_menus[] = {
         .select      = run_in_separate_task,
         .help  = "Reads the live MMU L1 table to map key regions (is 0xa0000000 mapped? cached twin?).",
         .help2 = "Safe: only reads the L1 table (RAM), never 0xa0000000. -> ML/LOGS/MMU.TXT.",
+    },
+    {
+        .name        = "Probe a3 rd",
+        .priv        = a3probe_task,
+        .select      = run_in_separate_task,
+        .help  = "CRASH-TEST: reads 0x40/0x76 (must pass) then 0xa0/0xa3 (stills-raw bank). May crash.",
+        .help2 = "Settles if 0xa3 is CPU-readable or imaging-DMA-only. -> ML/LOGS/A3PROBE.TXT (last line=culprit).",
     },
     {
         .name        = "Raw bright test",
