@@ -529,3 +529,13 @@ CONCLUSION:
   full-res stills bank). idx24 geometry: full-res ~6720x4480 14-bit (11760 B/row) => a 4MB grab = top ~356 rows.
 - Tooling: Ghidra headless RE works via ~/gscripts/run_decomp.sh (clears the stale lock, uses dump_decomp.java
   / xrefs_to.java); JAVA_HOME=~/ghidra-setup/jdk. Dead slurp/EVF code removed (BSS 0x144800->0x143300).
+
+### RESULT (2026-06-21) -- ML CAPTURED THE LIVE FULL-RES STILLS RAW ✅
+- "Stills grab" worked first try: STILLGRAB.TXT first word = f14445c4 (NOT 0xAA), got=1, waited=1080ms,
+  idx24 hits=8 a0=a32df198 -> RWG24.BIN (4MB) = live sensor data, non-destructive (+0xa0 hook + timed RAM copy).
+- Confirmed GENUINE BAYER RAW: 14-bit values span 17..16353 (full scale); even/odd column delta ~3369 = CFA
+  modulation; sensor read-banding present. **Geometry: 6720 active px, 14-bit MSB-packed, row stride 11780 B**
+  (11760 + 20B line padding) -- de-shears to a clean horizontal raster at 11780. 4MB grab = top ~356 of ~4480
+  rows (low-detail test scene). NEXT: detailed scene + full-frame grab (8 hits may = 8 strips) -> DNG; then the
+  same hook/grab pattern for the LV-raw VIDEO path. The sec-18 "where/when/how + non-destructive intercept"
+  question is ANSWERED for stills.
