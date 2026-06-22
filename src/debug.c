@@ -1584,8 +1584,53 @@ static volatile int      rawhk_on;
 #define RAWHK_SEQ 12
 static volatile uint32_t rawhk_seq[RAWHK_SEQ];    /* every idx24 +0xa0 addr in order = the per-strip layout */
 static volatile int      rawhk_seqn;
-static volatile uint32_t rawhk_geo[11];           /* idx24 STILLS EDMAC 2D geometry, captured in the hook @a3 */
-static volatile uint32_t rawhk_geo_rb;            /* the register block it came from (sanity) */
+static volatile uint32_t rawhk_desc[15];          /* idx24 STILLS EDMAC descriptor, COMMITTED (paired w/ a3) */
+static volatile int      rawhk_desc_set;
+static volatile uint32_t rawhk_desc_pending[15];  /* last idx24 geometry seen; committed when a3 addr follows */
+static volatile int      rawhk_geo_pending;
+/* FULL replacement for FUN_e05364c2 -- the EDMAC geometry programmer -- patched in (via convert_f_patch_to_patch)
+ * ONLY during the grab, then unpatched. It is a faithful C translation of the ROM decompile: it performs the SAME
+ * masked register writes Canon does (writing 0xd0487xxx +0x48..0x70 is safe -- only READING those mid-transfer
+ * faults), and additionally snapshots idx24's descriptor (param_2, in RAM) into a pending buffer. The +0xa0 hook
+ * commits that buffer once idx24 is pointed at the a3 stills frame, so we keep the STILLS geometry (not LiveView).
+ * Table @0xe0dd5c64 (ROM); masks 7ffffffe/0fff1fff/0007fffe/0003fffe (ROM, read live). desc[7..14]=xs/ys/xa/ya/
+ * xb/yb/xn/yn, desc[0..6]=off1/off2/off3. The two FUN_e05ed578 calls are validity asserts -- safely omitted. */
+void rawhk_geo_wrapper(uint32_t chan, uint32_t *desc);
+void rawhk_geo_wrapper(uint32_t chan, uint32_t *desc)
+{
+    if (chan == 24 && desc && !rawhk_desc_set)
+    {
+        for (int i = 0; i < 15; i++) rawhk_desc_pending[i] = desc[i];
+        rawhk_geo_pending = 1;
+    }
+    uint32_t tbl  = *(volatile uint32_t *)0xE05366D8;          /* DmacInfo table base = 0xe0dd5c64 (ROM) */
+    uint32_t flag = *(volatile uint8_t  *)(tbl + chan * 8 + 4);/* per-channel caps flag byte (ROM) */
+    uint32_t rb   = *(volatile uint32_t *)(tbl + chan * 8);    /* register block (0xd0487100 for chan24) */
+    uint32_t M1   = *(volatile uint32_t *)0xE053677C;          /* 0x7ffffffe */
+    uint32_t Myn  = *(volatile uint32_t *)0xE0536780;          /* 0x0fff1fff */
+    uint32_t Moff = *(volatile uint32_t *)0xE0536784;          /* 0x0007fffe */
+    uint32_t Mo3  = *(volatile uint32_t *)0xE0536788;          /* 0x0003fffe */
+    uint32_t v16 = (desc[8] | ((uint32_t)(uint16_t)desc[0xb] << 16)) & M1;
+    uint32_t v15 = (desc[9] | ((uint32_t)(uint16_t)desc[0xc] << 16)) & M1;
+    uint32_t v5  = desc[0xd], v3 = desc[0xe];
+    uint32_t v6  = desc[0] & Moff, v7 = desc[3] & 0xfffffffe, v8 = desc[1] & Moff;
+    uint32_t v9  = desc[4], v10 = desc[2], v11 = desc[5], v12 = desc[6];
+    uint32_t v13 = desc[8] & Mo3, v17 = desc[9] & Mo3;
+    uint32_t v1  = Myn, v2 = Moff;
+    if (flag & 0x20u) { v1 = 0xffff1fff; v2 = 0xfffffffe; v8 = desc[1] & 0xfffffffe; }
+    *(volatile uint32_t *)(rb + 0x48) = (desc[7] | ((uint32_t)(uint16_t)desc[10] << 16)) & M1;
+    *(volatile uint32_t *)(rb + 0x4c) = v16;
+    *(volatile uint32_t *)(rb + 0x50) = v15;
+    *(volatile uint32_t *)(rb + 0x54) = (v5 | ((uint32_t)(uint16_t)v3 << 16)) & v1;
+    if (flag & 0x20u) { *(volatile uint32_t *)(rb + 0x58) = v13; v7 = v17; }
+    else              { *(volatile uint32_t *)(rb + 0x58) = v6; }
+    *(volatile uint32_t *)(rb + 0x5c) = v7;
+    *(volatile uint32_t *)(rb + 0x60) = v8;
+    *(volatile uint32_t *)(rb + 0x64) = v9  & 0xfffffffe;
+    *(volatile uint32_t *)(rb + 0x68) = v10 & v2;
+    *(volatile uint32_t *)(rb + 0x6c) = v11 & 0xfffffffe;
+    *(volatile uint32_t *)(rb + 0x70) = v12 & 0xfffffffe;
+}
 
 /* Replaces FUN_e05364b6 (a one-line leaf): *(DmacInfo[chan].pBlock + 0xa0) = addr.  r0=chan, r1=addr.
  * Log which channels get a buffer set + the addr (to find the RAW channel), then do the original write.
@@ -1604,9 +1649,14 @@ void rawhk_wrapper(uint32_t chan, uint32_t addr)
         rawhk_hits[chan]++;
         if (addr) rawhk_addr[chan] = addr;                    /* keep last non-zero (teardown writes 0) */
         if (chan == 24 && addr && rawhk_seqn < RAWHK_SEQ) rawhk_seq[rawhk_seqn++] = addr;   /* strip layout */
-        /* NB: reading idx24's geometry regs (0xd0487xxx +0x48..0x70) HERE -- during the live transfer -- HARD-FAULTS
-         * (confirmed: 2 crashes). 0xD0487xxx is only readable when idle, but by then Canon has reused the block.
-         * Geometry must come from the descriptor (param_2 of FUN_e05364c2) in RAM -- a separate, careful hook. */
+        /* Commit the STILLS geometry: the geo wrapper (FUN_e05364c2) ran just before this in the same SetEDmac and
+         * stashed idx24's descriptor in rawhk_desc_pending; now that idx24 is pointed at the a3 stills frame, keep
+         * it. RAM-only (no register reads -- those fault here). This pairs geometry to the a3 buffer specifically. */
+        if (chan == 24 && (addr & 0xFF000000u) == 0xa3000000u && rawhk_geo_pending && !rawhk_desc_set)
+        {
+            for (int i = 0; i < 15; i++) rawhk_desc[i] = rawhk_desc_pending[i];
+            rawhk_desc_set = 1;
+        }
     }
     *(volatile uint32_t *)(pblock + 0xa0) = addr;             /* replicate FUN_e05364b6 */
 }
@@ -1660,6 +1710,25 @@ static void rawhk_task(void)
         return;
     }
     uint32_t patched = *(volatile uint32_t *)0xE05364B6;   /* should read back f000f8df (ldr.w pc,[pc]) */
+    /* ALSO replace FUN_e05364c2 @0xE05364C2 (geometry programmer) with rawhk_geo_wrapper, to snapshot idx24's
+     * stills descriptor from RAM. Same 0xE0530000 page -- already MMU-bumped by the +a0 patch above.
+     * orig 8 bytes: 2d e9 f0 4f (push.w {r4-r11,lr}); 05 46 (mov r5,r0); 83 48 (ldr r0,[pc,#0x20c]). */
+    rawhk_desc_set = 0; rawhk_geo_pending = 0;
+    static struct function_hook_patch fhp_geo;
+    static struct patch p_geo;
+    static uint8_t hookmem_geo[8];
+    fhp_geo.patch_addr = 0xE05364C2;
+    static const uint8_t oc_geo[8] = {0x2d, 0xe9, 0xf0, 0x4f, 0x05, 0x46, 0x83, 0x48};
+    for (int i = 0; i < 8; i++) fhp_geo.orig_content[i] = oc_geo[i];
+    fhp_geo.target_function_addr = (uint32_t)&rawhk_geo_wrapper;
+    fhp_geo.description = "geo desc cap";
+    if (convert_f_patch_to_patch(&fhp_geo, &p_geo, hookmem_geo) == 0)
+    {
+        if (apply_patches(&p_geo, 1))
+            NotifyBox(6000, "geo hook: apply_patches failed (geom stays unset, safe)");
+    }
+    else
+        NotifyBox(6000, "geo hook: convert_f_patch failed (geom stays unset, safe)");
 
     if (rawlv)
     {
@@ -1724,10 +1793,12 @@ static void rawhk_task(void)
         gn += snprintf(geo + gn, sizeof(geo) - gn, "EDMAC geometry (idx24 stills ram=%08x). regs hi16|lo16:\n",
                        (unsigned)rawhk_addr[24]);
         gn += snprintf(geo + gn, sizeof(geo) - gn,
-            "STILLS geom (in-hook @a3, rb=%08x): ynxn=%08x ybxb=%08x yaxa=%08x ysxs=%08x o1a=%08x o1b=%08x o2a=%08x o2b=%08x o3=%08x o1s=%08x o2s=%08x\n",
-            (unsigned)rawhk_geo_rb, (unsigned)rawhk_geo[0], (unsigned)rawhk_geo[1], (unsigned)rawhk_geo[2], (unsigned)rawhk_geo[3],
-            (unsigned)rawhk_geo[4], (unsigned)rawhk_geo[5], (unsigned)rawhk_geo[6], (unsigned)rawhk_geo[7], (unsigned)rawhk_geo[8],
-            (unsigned)rawhk_geo[9], (unsigned)rawhk_geo[10]);
+            "STILLS descriptor (FUN_e05364c2 param_2, set=%d): %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n"
+            "  => off d0..d6 | xs=d7 ys=d10 | xa=d8 ya=d11 | xb=d9 yb=d12 | xn=d13 yn=d14\n",
+            rawhk_desc_set, (unsigned)rawhk_desc[0], (unsigned)rawhk_desc[1], (unsigned)rawhk_desc[2], (unsigned)rawhk_desc[3],
+            (unsigned)rawhk_desc[4], (unsigned)rawhk_desc[5], (unsigned)rawhk_desc[6], (unsigned)rawhk_desc[7], (unsigned)rawhk_desc[8],
+            (unsigned)rawhk_desc[9], (unsigned)rawhk_desc[10], (unsigned)rawhk_desc[11], (unsigned)rawhk_desc[12],
+            (unsigned)rawhk_desc[13], (unsigned)rawhk_desc[14]);
         gn += snprintf(geo + gn, sizeof(geo) - gn, "per-channel @quiescence (post-shot reconfig, for reference):\n");
         /* The DmacInfo table at 0xe0dd5c64 (ROM) maps idx -> register block (idx24 -> 0xd0487100). Read ONLY the
          * known imaging channels' real blocks -- the prior blind 0xC0F0xxxx iteration hit absent regs and faulted.
@@ -1809,7 +1880,7 @@ static void rawhk_task(void)
         { FILE * ef = FIO_CreateFile("ML/LOGS/EDMACGEO.TXT"); if (ef) { FIO_WriteFile(ef, geo, gn); FIO_CloseFile(ef); } }
         msleep(300);
         rawhk_on = 0; msleep(50);
-        unpatch_memory(0xE05364B6);
+        unpatch_memory(0xE05364B6); unpatch_memory(0xE05364C2);
         NotifyBox(13000, "Full-frame grab done -> RWFULL.BIN + STILLGRAB.TXT");
         return;
     }
@@ -1860,7 +1931,7 @@ static void rawhk_task(void)
     msleep(2000);
     rawhk_on = 0;
     msleep(50);
-    unpatch_memory(0xE05364B6);
+    unpatch_memory(0xE05364B6); unpatch_memory(0xE05364C2);
     if (rawlv) { call("lv_save_raw", 0); }   /* restore: stop Canon raw LV output */
     if (blob)
     {
