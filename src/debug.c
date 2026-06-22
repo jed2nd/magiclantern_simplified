@@ -1714,15 +1714,27 @@ static void rawhk_task(void)
             }
             first24 = got24 ? *(volatile uint32_t *)stg : 0;
         }
+        /* probe idx24's CONTIGUOUS continuation a4..a9 RIGHT NOW (a3 still live at quiescence): if mapped + not
+         * 0xAA, the full ~106MB dual-pixel frame is one buffer a3->a9, reachable here (then capture needs >16MB
+         * staging or a stream). If unmapped/0xAA, the continuation is already gone -> must catch it earlier, at
+         * the CORRECTION event (0x40000). MMU-checked so an unmapped supersection can't fault. */
+        char cont[260]; int cn = 0;
+        for (uint32_t bk = 0xa4000000u; bk <= 0xa9000000u; bk += 0x01000000u)
+        {
+            int m = A3_MAPPED(bk);
+            uint32_t fw = m ? *(volatile uint32_t *)UNCACHEABLE(bk) : 0;
+            cn += snprintf(cont + cn, sizeof(cont) - cn, "cont %08x map=%d first=%08x\n", (unsigned)bk, m, (unsigned)fw);
+        }
         int w2 = 0; while (!sg_done && w2 < 12000) { msleep(50); w2 += 50; }
         msleep(400);   /* let the camera finish the CR3 write + release the card */
         { FILE * df = FIO_CreateFile("ML/LOGS/RWF24.BIN");
           if (df) { for (uint32_t o = 0; o < got24; o += 0x10000u) FIO_WriteFile(df, (uint8_t *)stg + o, 0x10000u); FIO_CloseFile(df); } }
         tn += snprintf(tb + tn, sizeof(tb) - tn,
-            "SCRIPTED grab. waited=%dms q=%d sg_done=%d w2=%dms stage=%uMB\n"
+            "SCRIPTED grab. waited=%dms q=%d sg_done=%d w2=%dms stage=%dMB\n"
             "idx24 a=%08x first=%08x got=%dMB hits=%d (read LIVE @quiescence, written after shot freed card)\n",
-            waited, quiesced, sg_done, w2, (unsigned)(stagesz >> 20),
+            waited, quiesced, sg_done, w2, (int)(stagesz >> 20),
             (unsigned)a24, (unsigned)first24, (int)(got24 >> 20), (int)rawhk_hits[24]);
+        tn += snprintf(tb + tn, sizeof(tb) - tn, "%s", cont);
         /* the OTHER channels now (card free). idx25/58 are imaging banks (may be wiped post-shot); idx59/60/61 are
          * main RAM (persist). Each capped to its supersection + MMU-checked = crash-safe -> RWF<idx>.BIN. */
         static const int chans[] = { 25, 58, 59, 60, 61 };
