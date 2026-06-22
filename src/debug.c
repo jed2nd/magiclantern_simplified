@@ -1689,8 +1689,12 @@ static void rawhk_task(void)
          * RELEASEs/wipes, then write. The R's SRM is dead, but shoot_malloc_suite_contig uses the WORKING
          * AllocateContinuousMemoryResource (resource mgr) -> one contiguous chunk from MAIN RAM (0x4x), a different
          * pool than the imaging banks (0xa0+), so it can't starve the sensor->a3..a9 capture. Alloc BEFORE the shot
-         * (the autodetect probe is slow); try frame-size down; fall back to the small fio heap. */
-        static const uint32_t try_sz[] = { 0x6C00000u, 0x6000000u, 0x4000000u, 0x2000000u };   /* 108/96/64/32 MB */
+         * (the autodetect probe is slow), fall back to the small fio heap. CAPPED at 64MB this run: Gemini warns
+         * holding ~106MB can Err70 -- Canon's CR3 Save task allocates MAIN RAM after the shot and panics if we
+         * starved the pool. 64MB grabs ~58% of the frame AND proves the path survives a real shot; size up next
+         * run (or block the CR3 save) once confirmed. _shoot_get_free_space() is a stub (31.5MB const) so we can't
+         * size adaptively -- step up empirically. */
+        static const uint32_t try_sz[] = { 0x4000000u, 0x3000000u, 0x2000000u };   /* 64 / 48 / 32 MB */
         struct memSuite * ms = 0;
         for (unsigned i = 0; i < sizeof(try_sz) / sizeof(try_sz[0]) && !ms; i++) ms = shoot_malloc_suite_contig(try_sz[i]);
         void * stg = 0; uint32_t stagesz = 0;
