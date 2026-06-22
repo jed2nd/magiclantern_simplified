@@ -1584,6 +1584,8 @@ static volatile int      rawhk_on;
 #define RAWHK_SEQ 12
 static volatile uint32_t rawhk_seq[RAWHK_SEQ];    /* every idx24 +0xa0 addr in order = the per-strip layout */
 static volatile int      rawhk_seqn;
+static volatile uint32_t rawhk_geo[11];           /* idx24 STILLS EDMAC 2D geometry, captured in the hook @a3 */
+static volatile uint32_t rawhk_geo_rb;            /* the register block it came from (sanity) */
 
 /* Replaces FUN_e05364b6 (a one-line leaf): *(DmacInfo[chan].pBlock + 0xa0) = addr.  r0=chan, r1=addr.
  * Log which channels get a buffer set + the addr (to find the RAW channel), then do the original write.
@@ -1602,6 +1604,24 @@ void rawhk_wrapper(uint32_t chan, uint32_t addr)
         rawhk_hits[chan]++;
         if (addr) rawhk_addr[chan] = addr;                    /* keep last non-zero (teardown writes 0) */
         if (chan == 24 && addr && rawhk_seqn < RAWHK_SEQ) rawhk_seq[rawhk_seqn++] = addr;   /* strip layout */
+        /* capture idx24's STILLS 2D geometry NOW (it's pointed at the a3 frame; SetEDmac programs geometry before
+         * the +0xa0 address, so the regs hold the stills config here -- by quiescence Canon has reused the block).
+         * pblock = idx24's reg block (0xd0487100); guard it's a real 0xd0xxxxxx block before reading. */
+        if (chan == 24 && (addr & 0xFF000000u) == 0xa3000000u && (pblock & 0xF0000000u) == 0xd0000000u)
+        {
+            rawhk_geo[0]  = *(volatile uint32_t *)(pblock + 0x54);   /* ynxn */
+            rawhk_geo[1]  = *(volatile uint32_t *)(pblock + 0x50);   /* ybxb */
+            rawhk_geo[2]  = *(volatile uint32_t *)(pblock + 0x4c);   /* yaxa */
+            rawhk_geo[3]  = *(volatile uint32_t *)(pblock + 0x48);   /* ysxs */
+            rawhk_geo[4]  = *(volatile uint32_t *)(pblock + 0x60);   /* off1a */
+            rawhk_geo[5]  = *(volatile uint32_t *)(pblock + 0x68);   /* off1b */
+            rawhk_geo[6]  = *(volatile uint32_t *)(pblock + 0x64);   /* off2a */
+            rawhk_geo[7]  = *(volatile uint32_t *)(pblock + 0x6c);   /* off2b */
+            rawhk_geo[8]  = *(volatile uint32_t *)(pblock + 0x70);   /* off3 */
+            rawhk_geo[9]  = *(volatile uint32_t *)(pblock + 0x58);   /* off1s */
+            rawhk_geo[10] = *(volatile uint32_t *)(pblock + 0x5c);   /* off2s */
+            rawhk_geo_rb  = pblock;
+        }
     }
     *(volatile uint32_t *)(pblock + 0xa0) = addr;             /* replicate FUN_e05364b6 */
 }
@@ -1715,9 +1735,15 @@ static void rawhk_task(void)
          * yn/xn (total), yb/xb (block), ya/xa, ys/xs, off1/off2/off3 = the true memory map. Offsets per ML's
          * edmac_mmio (D8): +0x48 ysxs +0x4c yaxa +0x50 ybxb +0x54 ynxn +0x58 o1s +0x5c o2s +0x60 o1a +0x64 o2a
          * +0x68 o1b +0x6c o2b +0x70 o3 +0xa0 ram. MMIO reads (no card I/O), buffered -> EDMACGEO.TXT at the end. */
-        char geo[1500]; int gn = 0;
-        gn += snprintf(geo + gn, sizeof(geo) - gn, "EDMAC geometry @quiescence (idx24 ram=%08x). regs are hi16|lo16:\n",
+        char geo[1700]; int gn = 0;
+        gn += snprintf(geo + gn, sizeof(geo) - gn, "EDMAC geometry (idx24 stills ram=%08x). regs hi16|lo16:\n",
                        (unsigned)rawhk_addr[24]);
+        gn += snprintf(geo + gn, sizeof(geo) - gn,
+            "STILLS geom (in-hook @a3, rb=%08x): ynxn=%08x ybxb=%08x yaxa=%08x ysxs=%08x o1a=%08x o1b=%08x o2a=%08x o2b=%08x o3=%08x o1s=%08x o2s=%08x\n",
+            (unsigned)rawhk_geo_rb, (unsigned)rawhk_geo[0], (unsigned)rawhk_geo[1], (unsigned)rawhk_geo[2], (unsigned)rawhk_geo[3],
+            (unsigned)rawhk_geo[4], (unsigned)rawhk_geo[5], (unsigned)rawhk_geo[6], (unsigned)rawhk_geo[7], (unsigned)rawhk_geo[8],
+            (unsigned)rawhk_geo[9], (unsigned)rawhk_geo[10]);
+        gn += snprintf(geo + gn, sizeof(geo) - gn, "per-channel @quiescence (post-shot reconfig, for reference):\n");
         /* The DmacInfo table at 0xe0dd5c64 (ROM) maps idx -> register block (idx24 -> 0xd0487100). Read ONLY the
          * known imaging channels' real blocks -- the prior blind 0xC0F0xxxx iteration hit absent regs and faulted.
          * MMU-check each block first. ram(+0xa0) should == idx24's addr = confirms the right block. */
