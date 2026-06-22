@@ -1681,17 +1681,22 @@ static void rawhk_task(void)
          * 0xa4.. can't fault. Records all idx24 +0xa0 addresses (rawhk_seq) = the per-strip layout for later
          * full-frame assembly. -> ML/LOGS/RWGF24.BIN (+ RWGF25.BIN) + STILLGRAB.TXT. */
         sg_done = 0;
-        task_create("sgshut", 0x1a, 0x2000, (void *)sg_shutter, 0);   /* fire the photo ourselves (scripted) */
         uint32_t ttbr1 = 0; asm volatile ("mrc p15, 0, %0, c2, c0, 1" : "=r"(ttbr1));
         uint32_t t1 = ttbr1 & ~0x3FFFu;
 #define A3_MAPPED(va) ((*(volatile uint32_t *)(t1 + (((va) >> 20) << 2)) & 3u) != 0u)
-        /* BIG STAGE -- the cont-probe proved a3..a9 are ALL mapped + live at quiescence, so the whole ~106MB frame
-         * is one contiguous buffer. Reading it section-by-section across slow SD writes LOSES the tail (imaging
-         * banks get RELEASED/wiped while we dawdle -- idx58 read 0xAA). So grab the WHOLE frame into RAM FAST first
-         * (memcpy, sub-second), THEN write. Try the largest fio_malloc we can get; log the ceiling we actually hit. */
-        static const uint32_t try_sz[] = { 0x6C00000u, 0x6000000u, 0x5000000u, 0x4000000u, 0x3000000u, 0x2000000u, 0x1000000u, 0x800000u };
+        /* BIG CONTIGUOUS STAGE -- the cont-probe proved a3..a9 are ALL mapped + live at quiescence, so the whole
+         * ~106MB frame is one contiguous buffer. Read it into RAM FAST (one memcpy pass, NO SD I/O) before the bank
+         * RELEASEs/wipes, then write. The R's SRM is dead, but shoot_malloc_suite_contig uses the WORKING
+         * AllocateContinuousMemoryResource (resource mgr) -> one contiguous chunk from MAIN RAM (0x4x), a different
+         * pool than the imaging banks (0xa0+), so it can't starve the sensor->a3..a9 capture. Alloc BEFORE the shot
+         * (the autodetect probe is slow); try frame-size down; fall back to the small fio heap. */
+        static const uint32_t try_sz[] = { 0x6C00000u, 0x6000000u, 0x4000000u, 0x2000000u };   /* 108/96/64/32 MB */
+        struct memSuite * ms = 0;
+        for (unsigned i = 0; i < sizeof(try_sz) / sizeof(try_sz[0]) && !ms; i++) ms = shoot_malloc_suite_contig(try_sz[i]);
         void * stg = 0; uint32_t stagesz = 0;
-        for (unsigned i = 0; i < sizeof(try_sz) / sizeof(try_sz[0]); i++) { stg = fio_malloc(try_sz[i]); if (stg) { stagesz = try_sz[i]; break; } }
+        if (ms) { struct memChunk * ch = GetFirstChunkFromSuite(ms); stg = GetMemoryAddressOfMemoryChunk(ch); stagesz = (uint32_t)GetSizeOfMemoryChunk(ch); }
+        if (!stg) { stagesz = 0x1000000u; while (stagesz >= 0x400000u) { stg = fio_malloc(stagesz); if (stg) break; stagesz >>= 1; } }   /* fallback */
+        task_create("sgshut", 0x1a, 0x2000, (void *)sg_shutter, 0);   /* buffer ready -> NOW fire the photo */
         int waited = 0, stable = 0, quiesced = 0; uint32_t last = 0;
         while (waited < 15000)
         {
@@ -1717,19 +1722,26 @@ static void rawhk_task(void)
                 fn += snprintf(fw + fn, sizeof(fw) - fn, "  +%dMB %08x\n", (int)(o >> 20),
                                (unsigned)*(volatile uint32_t *)((uint8_t *)stg + o));
         }
-#undef A3_MAPPED
         int w2 = 0; while (!sg_done && w2 < 12000) { msleep(50); w2 += 50; }   /* shot done -> card free */
         msleep(400);
         { FILE * df = FIO_CreateFile("ML/LOGS/RWFULL.BIN");
           if (df) { for (uint32_t o = 0; o < got; o += 0x40000u) FIO_WriteFile(df, (uint8_t *)stg + o, 0x40000u); FIO_CloseFile(df); } }
-        if (stg) fio_free(stg);
-        char tb[600]; int tn = 0;
+        if (ms) shoot_free_suite(ms); else if (stg) fio_free(stg);
+        /* AFTER the shot + writes, re-probe a3..a9: if still mapped + non-0xAA, Canon holds the stills buffer well
+         * past RELEASE -> a no-alloc "stream a3..a9 straight to card after the shot" path is also viable (fallback). */
+        char pz[230]; int pzn = 0;
+        for (uint32_t bk = 0xa3000000u; bk <= 0xa9000000u; bk += 0x01000000u)
+            pzn += snprintf(pz + pzn, sizeof(pz) - pzn, "  post %08x map=%d first=%08x\n", (unsigned)bk, A3_MAPPED(bk),
+                            (unsigned)(A3_MAPPED(bk) ? *(volatile uint32_t *)UNCACHEABLE(bk) : 0));
+#undef A3_MAPPED
+        char tb[760]; int tn = 0;
         tn += snprintf(tb + tn, sizeof(tb) - tn,
-            "FULL-FRAME grab. waited=%dms q=%d sg_done=%d w2=%dms stage=%dMB base=%08x got=%dMB\n"
+            "FULL-FRAME grab. waited=%dms q=%d sg_done=%d w2=%dms alloc=%s stage=%dMB base=%08x got=%dMB\n"
             "(read a3.. contiguous into RAM at quiescence, written as RWFULL.BIN after the shot freed the card)\n"
             "first word per 16MB section (all non-0xAA/non-zero = whole frame captured live):\n",
-            waited, quiesced, sg_done, w2, (int)(stagesz >> 20), (unsigned)base, (int)(got >> 20));
+            waited, quiesced, sg_done, w2, ms ? "shoot" : "fio", (int)(stagesz >> 20), (unsigned)base, (int)(got >> 20));
         tn += snprintf(tb + tn, sizeof(tb) - tn, "%s", fw);
+        tn += snprintf(tb + tn, sizeof(tb) - tn, "a3..a9 AFTER shot (persistence = direct-write viability):\n%s", pz);
         FILE * tf = FIO_CreateFile("ML/LOGS/STILLGRAB.TXT");
         if (tf) { FIO_WriteFile(tf, tb, tn); FIO_CloseFile(tf); }
         msleep(300);
