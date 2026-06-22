@@ -1718,23 +1718,22 @@ static void rawhk_task(void)
         char geo[1500]; int gn = 0;
         gn += snprintf(geo + gn, sizeof(geo) - gn, "EDMAC geometry @quiescence (idx24 ram=%08x). regs are hi16|lo16:\n",
                        (unsigned)rawhk_addr[24]);
-        for (uint32_t ch = 0; ch < 0x30; ch++)
+        /* The DmacInfo table at 0xe0dd5c64 (ROM) maps idx -> register block (idx24 -> 0xd0487100). Read ONLY the
+         * known imaging channels' real blocks -- the prior blind 0xC0F0xxxx iteration hit absent regs and faulted.
+         * MMU-check each block first. ram(+0xa0) should == idx24's addr = confirms the right block. */
+        static const int gch[] = { 24, 25, 58, 59, 60, 61 };
+        for (unsigned gi = 0; gi < sizeof(gch) / sizeof(gch[0]); gi++)
         {
-            uint32_t blk = ch >> 4, num = ch & 0xF;
-            static const uint32_t bs[] = { 0xC0F04000u, 0xC0F26000u, 0xC0F30000u };
-            if (blk >= 3) continue;
-            uint32_t b = bs[blk] + (num << 8);
-            uint32_t ram = *(volatile uint32_t *)(b + 0xa0);
-            if ((ram & 0xF0000000u) != 0xa0000000u) continue;          /* imaging banks (0xa0+) only */
+            uint32_t rb = *(volatile uint32_t *)(0xe0dd5c64u + (uint32_t)gch[gi] * 8);
+            if (!rb || !A3_MAPPED(rb)) { gn += snprintf(geo + gn, sizeof(geo) - gn, "idx%d rb=%08x unmapped\n", gch[gi], (unsigned)rb); continue; }
             gn += snprintf(geo + gn, sizeof(geo) - gn,
-                "ch%d ram=%08x ynxn=%08x ybxb=%08x yaxa=%08x ysxs=%08x o1a=%08x o1b=%08x o2a=%08x o2b=%08x o3=%08x o1s=%08x o2s=%08x\n",
-                (int)ch, (unsigned)ram,
-                (unsigned)*(volatile uint32_t *)(b + 0x54), (unsigned)*(volatile uint32_t *)(b + 0x50),
-                (unsigned)*(volatile uint32_t *)(b + 0x4c), (unsigned)*(volatile uint32_t *)(b + 0x48),
-                (unsigned)*(volatile uint32_t *)(b + 0x60), (unsigned)*(volatile uint32_t *)(b + 0x68),
-                (unsigned)*(volatile uint32_t *)(b + 0x64), (unsigned)*(volatile uint32_t *)(b + 0x6c),
-                (unsigned)*(volatile uint32_t *)(b + 0x70), (unsigned)*(volatile uint32_t *)(b + 0x58),
-                (unsigned)*(volatile uint32_t *)(b + 0x5c));
+                "idx%d rb=%08x ram=%08x ynxn=%08x ybxb=%08x yaxa=%08x ysxs=%08x o1a=%08x o1b=%08x o2a=%08x o2b=%08x o3=%08x\n",
+                gch[gi], (unsigned)rb, (unsigned)*(volatile uint32_t *)(rb + 0xa0),
+                (unsigned)*(volatile uint32_t *)(rb + 0x54), (unsigned)*(volatile uint32_t *)(rb + 0x50),
+                (unsigned)*(volatile uint32_t *)(rb + 0x4c), (unsigned)*(volatile uint32_t *)(rb + 0x48),
+                (unsigned)*(volatile uint32_t *)(rb + 0x60), (unsigned)*(volatile uint32_t *)(rb + 0x68),
+                (unsigned)*(volatile uint32_t *)(rb + 0x64), (unsigned)*(volatile uint32_t *)(rb + 0x6c),
+                (unsigned)*(volatile uint32_t *)(rb + 0x70));
         }
         /* Read the contiguous frame from idx24's live addr upward (a32df198 -> a3ffffff -> a4 .. a9), MMU-checked
          * per 1MB so an unmapped supersection stops us cleanly. NO SD I/O in this loop -> the whole grab into RAM
