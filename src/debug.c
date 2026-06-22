@@ -1709,6 +1709,33 @@ static void rawhk_task(void)
             if (h && h == last) { if (++stable >= 3) { quiesced = 1; break; } }   /* ~60ms no new idx24 write */
             else { stable = 0; last = h; }
         }
+        /* EDMAC GEOMETRY = ground truth for the a4+ tiling. idx24 does a 2D/3D EDMAC transfer; its layout lives in
+         * the channel's DIGIC-8 mmio registers (base 0xC0F0xxxx). Read every imaging channel's geometry NOW (regs
+         * still hold it post-transfer); the channel whose ram_addr (+0xa0, = our hook) == idx24's gives the exact
+         * yn/xn (total), yb/xb (block), ya/xa, ys/xs, off1/off2/off3 = the true memory map. Offsets per ML's
+         * edmac_mmio (D8): +0x48 ysxs +0x4c yaxa +0x50 ybxb +0x54 ynxn +0x58 o1s +0x5c o2s +0x60 o1a +0x64 o2a
+         * +0x68 o1b +0x6c o2b +0x70 o3 +0xa0 ram. MMIO reads (no card I/O), buffered -> EDMACGEO.TXT at the end. */
+        char geo[1500]; int gn = 0;
+        gn += snprintf(geo + gn, sizeof(geo) - gn, "EDMAC geometry @quiescence (idx24 ram=%08x). regs are hi16|lo16:\n",
+                       (unsigned)rawhk_addr[24]);
+        for (uint32_t ch = 0; ch < 0x30; ch++)
+        {
+            uint32_t blk = ch >> 4, num = ch & 0xF;
+            static const uint32_t bs[] = { 0xC0F04000u, 0xC0F26000u, 0xC0F30000u };
+            if (blk >= 3) continue;
+            uint32_t b = bs[blk] + (num << 8);
+            uint32_t ram = *(volatile uint32_t *)(b + 0xa0);
+            if ((ram & 0xF0000000u) != 0xa0000000u) continue;          /* imaging banks (0xa0+) only */
+            gn += snprintf(geo + gn, sizeof(geo) - gn,
+                "ch%d ram=%08x ynxn=%08x ybxb=%08x yaxa=%08x ysxs=%08x o1a=%08x o1b=%08x o2a=%08x o2b=%08x o3=%08x o1s=%08x o2s=%08x\n",
+                (int)ch, (unsigned)ram,
+                (unsigned)*(volatile uint32_t *)(b + 0x54), (unsigned)*(volatile uint32_t *)(b + 0x50),
+                (unsigned)*(volatile uint32_t *)(b + 0x4c), (unsigned)*(volatile uint32_t *)(b + 0x48),
+                (unsigned)*(volatile uint32_t *)(b + 0x60), (unsigned)*(volatile uint32_t *)(b + 0x68),
+                (unsigned)*(volatile uint32_t *)(b + 0x64), (unsigned)*(volatile uint32_t *)(b + 0x6c),
+                (unsigned)*(volatile uint32_t *)(b + 0x70), (unsigned)*(volatile uint32_t *)(b + 0x58),
+                (unsigned)*(volatile uint32_t *)(b + 0x5c));
+        }
         /* Read the contiguous frame from idx24's live addr upward (a32df198 -> a3ffffff -> a4 .. a9), MMU-checked
          * per 1MB so an unmapped supersection stops us cleanly. NO SD I/O in this loop -> the whole grab into RAM
          * finishes (sub-second) BEFORE the camera RELEASEs/wipes the bank, so the tail isn't lost. */
@@ -1769,6 +1796,7 @@ static void rawhk_task(void)
         tn += snprintf(tb + tn, sizeof(tb) - tn, "a3..a9 AFTER shot (persistence = direct-write viability):\n%s", pz);
         FILE * tf = FIO_CreateFile("ML/LOGS/STILLGRAB.TXT");
         if (tf) { FIO_WriteFile(tf, tb, tn); FIO_CloseFile(tf); }
+        { FILE * ef = FIO_CreateFile("ML/LOGS/EDMACGEO.TXT"); if (ef) { FIO_WriteFile(ef, geo, gn); FIO_CloseFile(ef); } }
         msleep(300);
         rawhk_on = 0; msleep(50);
         unpatch_memory(0xE05364B6);
