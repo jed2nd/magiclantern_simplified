@@ -1685,9 +1685,13 @@ static void rawhk_task(void)
         uint32_t ttbr1 = 0; asm volatile ("mrc p15, 0, %0, c2, c0, 1" : "=r"(ttbr1));
         uint32_t t1 = ttbr1 & ~0x3FFFu;
 #define A3_MAPPED(va) ((*(volatile uint32_t *)(t1 + (((va) >> 20) << 2)) & 3u) != 0u)
-        uint32_t stagesz = 0x1000000u;                 /* 16MB; must stay < 20MB (SRM off) */
-        void * stg = 0;
-        while (stagesz >= 0x400000u) { stg = fio_malloc(stagesz); if (stg) break; stagesz >>= 1; }
+        /* BIG STAGE -- the cont-probe proved a3..a9 are ALL mapped + live at quiescence, so the whole ~106MB frame
+         * is one contiguous buffer. Reading it section-by-section across slow SD writes LOSES the tail (imaging
+         * banks get RELEASED/wiped while we dawdle -- idx58 read 0xAA). So grab the WHOLE frame into RAM FAST first
+         * (memcpy, sub-second), THEN write. Try the largest fio_malloc we can get; log the ceiling we actually hit. */
+        static const uint32_t try_sz[] = { 0x6C00000u, 0x6000000u, 0x5000000u, 0x4000000u, 0x3000000u, 0x2000000u, 0x1000000u, 0x800000u };
+        void * stg = 0; uint32_t stagesz = 0;
+        for (unsigned i = 0; i < sizeof(try_sz) / sizeof(try_sz[0]); i++) { stg = fio_malloc(try_sz[i]); if (stg) { stagesz = try_sz[i]; break; } }
         int waited = 0, stable = 0, quiesced = 0; uint32_t last = 0;
         while (waited < 15000)
         {
@@ -1696,113 +1700,42 @@ static void rawhk_task(void)
             if (h && h == last) { if (++stable >= 3) { quiesced = 1; break; } }   /* ~60ms no new idx24 write */
             else { stable = 0; last = h; }
         }
-        char tb[1600]; int tn = 0;
-        /* idx24 (a3, THE dual-pixel raw) is the priority AND its bank is WIPED to 0xAA at RELEASE, so read it into
-         * RAM NOW while live (right after DMA quiescence), THEN wait for the scripted shot to finish so the card is
-         * free -- the concurrent CR3 write blocks FIO_CreateFile (last run wrote 0 files), so we must defer our own
-         * writes until the camera releases the card. */
-        uint32_t a24 = rawhk_addr[24], got24 = 0, first24 = 0;
-        if (stg && a24)
+        /* Read the contiguous frame from idx24's live addr upward (a32df198 -> a3ffffff -> a4 .. a9), MMU-checked
+         * per 1MB so an unmapped supersection stops us cleanly. NO SD I/O in this loop -> the whole grab into RAM
+         * finishes (sub-second) BEFORE the camera RELEASEs/wipes the bank, so the tail isn't lost. */
+        uint32_t base = rawhk_addr[24] & ~0x40000000u, got = 0;
+        char fw[320]; int fn = 0;
+        if (stg && base)
         {
-            uint32_t cp = a24 & ~0x40000000u, e = (cp & 0xFF000000u) + 0x01000000u, lim = stagesz;
-            if (e - cp < lim) lim = e - cp;
-            for (uint32_t o = 0; o < lim; o += 0x100000u)
+            for (uint32_t o = 0; o < stagesz; o += 0x100000u)
             {
-                if (!A3_MAPPED(cp + o)) break;
-                memcpy((uint8_t *)stg + o, (void *)UNCACHEABLE(cp + o), 0x100000u);
-                got24 = o + 0x100000u;
-            }
-            first24 = got24 ? *(volatile uint32_t *)stg : 0;
-        }
-        /* probe idx24's CONTIGUOUS continuation a4..a9 RIGHT NOW (a3 still live at quiescence): if mapped + not
-         * 0xAA, the full ~106MB dual-pixel frame is one buffer a3->a9, reachable here (then capture needs >16MB
-         * staging or a stream). If unmapped/0xAA, the continuation is already gone -> must catch it earlier, at
-         * the CORRECTION event (0x40000). MMU-checked so an unmapped supersection can't fault. */
-        char cont[260]; int cn = 0;
-        for (uint32_t bk = 0xa4000000u; bk <= 0xa9000000u; bk += 0x01000000u)
-        {
-            int m = A3_MAPPED(bk);
-            uint32_t fw = m ? *(volatile uint32_t *)UNCACHEABLE(bk) : 0;
-            cn += snprintf(cont + cn, sizeof(cont) - cn, "cont %08x map=%d first=%08x\n", (unsigned)bk, m, (unsigned)fw);
-        }
-        int w2 = 0; while (!sg_done && w2 < 12000) { msleep(50); w2 += 50; }
-        msleep(400);   /* let the camera finish the CR3 write + release the card */
-        { FILE * df = FIO_CreateFile("ML/LOGS/RWF24.BIN");
-          if (df) { for (uint32_t o = 0; o < got24; o += 0x10000u) FIO_WriteFile(df, (uint8_t *)stg + o, 0x10000u); FIO_CloseFile(df); } }
-        tn += snprintf(tb + tn, sizeof(tb) - tn,
-            "SCRIPTED grab. waited=%dms q=%d sg_done=%d w2=%dms stage=%dMB\n"
-            "idx24 a=%08x first=%08x got=%dMB hits=%d (read LIVE @quiescence, written after shot freed card)\n",
-            waited, quiesced, sg_done, w2, (int)(stagesz >> 20),
-            (unsigned)a24, (unsigned)first24, (int)(got24 >> 20), (int)rawhk_hits[24]);
-        tn += snprintf(tb + tn, sizeof(tb) - tn, "%s", cont);
-        /* the OTHER channels now (card free). idx25/58 are imaging banks (may be wiped post-shot); idx59/60/61 are
-         * main RAM (persist). Each capped to its supersection + MMU-checked = crash-safe -> RWF<idx>.BIN. */
-        static const int chans[] = { 25, 58, 59, 60, 61 };
-        for (unsigned ci = 0; ci < sizeof(chans) / sizeof(chans[0]); ci++)
-        {
-            int c = chans[ci];
-            uint32_t a = rawhk_addr[c];
-            if (!stg || !a) { tn += snprintf(tb + tn, sizeof(tb) - tn, "idx%d: (no addr)\n", c); continue; }
-            uint32_t cp = a & ~0x40000000u;
-            /* main-RAM channels (orig addr 0x4x-0x7x) are fully backed -> read the whole 16MB stage. Only the
-             * imaging banks (0xa0+) have unbacked neighbours (0xa4+) -> cap those at their 16MB supersection. */
-            uint32_t lim = stagesz;
-            if (a >= 0x80000000u) { uint32_t e = (cp & 0xFF000000u) + 0x01000000u; if (e - cp < lim) lim = e - cp; }
-            uint32_t got = 0;
-            for (uint32_t o = 0; o < lim; o += 0x100000u)
-            {
-                if (!A3_MAPPED(cp + o)) break;
-                memcpy((uint8_t *)stg + o, (void *)UNCACHEABLE(cp + o), 0x100000u);
+                if (!A3_MAPPED(base + o)) break;
+                memcpy((uint8_t *)stg + o, (void *)UNCACHEABLE(base + o), 0x100000u);
                 got = o + 0x100000u;
             }
-            uint32_t first = got ? *(volatile uint32_t *)stg : 0;
-            char nm[24]; snprintf(nm, sizeof(nm), "ML/LOGS/RWF%d.BIN", c);
-            FILE * df = FIO_CreateFile(nm);
-            if (df) { for (uint32_t o = 0; o < got; o += 0x10000u) FIO_WriteFile(df, (uint8_t *)stg + o, 0x10000u); FIO_CloseFile(df); }
-            tn += snprintf(tb + tn, sizeof(tb) - tn, "idx%d a=%08x first=%08x got=%dMB hits=%d\n",
-                           c, (unsigned)a, (unsigned)first, (int)(got >> 20), (int)rawhk_hits[c]);
+            for (uint32_t o = 0; o < got; o += 0x1000000u)   /* first word at each 16MB -> which sections were live */
+                fn += snprintf(fw + fn, sizeof(fw) - fn, "  +%dMB %08x\n", (int)(o >> 20),
+                               (unsigned)*(volatile uint32_t *)((uint8_t *)stg + o));
         }
-        /* STRIP WALK (Gemini + Jed's sliding-window/rotation model): idx24's +0xa0 fires once per ~16MB strip as
-         * the sensor streams the frame; rawhk_seq is that strip layout (a3..a9). Re-read each recorded strip addr
-         * here -- the ones still mapped + non-0xAA = how much of the full frame survives to grab time. Distinct
-         * 16MB bases each -> RWS<n>.BIN (offline: concatenate in s-order for one full dual-pixel frame). If most
-         * strips read map=0/0xAA, the window already slid past -> escalate to a per-strip (CORRECTION-event) hook. */
-        tn += snprintf(tb + tn, sizeof(tb) - tn, "idx24 strip seq (n=%d) -- the per-strip a3..a9 layout:\n", rawhk_seqn);
-        uint32_t wbase[RAWHK_SEQ]; int wn = 0;
-        for (int s = 0; s < rawhk_seqn && stg; s++)
-        {
-            uint32_t sa = rawhk_seq[s];
-            uint32_t cp = sa & ~0x40000000u;
-            uint32_t base = cp & 0xFF000000u;
-            int dup = 0; for (int k = 0; k < wn; k++) if (wbase[k] == base) { dup = 1; break; }
-            int mapped = A3_MAPPED(cp);
-            uint32_t first = 0, got = 0;
-            if (mapped && !dup)
-            {
-                if (wn < (int)RAWHK_SEQ) wbase[wn++] = base;
-                uint32_t lim = stagesz, e = base + 0x01000000u; if (e - cp < lim) lim = e - cp;
-                for (uint32_t o = 0; o < lim; o += 0x100000u)
-                {
-                    if (!A3_MAPPED(cp + o)) break;
-                    memcpy((uint8_t *)stg + o, (void *)UNCACHEABLE(cp + o), 0x100000u);
-                    got = o + 0x100000u;
-                }
-                first = got ? *(volatile uint32_t *)stg : 0;
-                char nm[24]; snprintf(nm, sizeof(nm), "ML/LOGS/RWS%d.BIN", s);
-                FILE * sf = FIO_CreateFile(nm);
-                if (sf) { for (uint32_t o = 0; o < got; o += 0x10000u) FIO_WriteFile(sf, (uint8_t *)stg + o, 0x10000u); FIO_CloseFile(sf); }
-            }
-            tn += snprintf(tb + tn, sizeof(tb) - tn, "  s%d a=%08x map=%d dup=%d first=%08x got=%dMB\n",
-                           s, (unsigned)sa, mapped, dup, (unsigned)first, (int)(got >> 20));
-        }
-        if (stg) fio_free(stg);
 #undef A3_MAPPED
+        int w2 = 0; while (!sg_done && w2 < 12000) { msleep(50); w2 += 50; }   /* shot done -> card free */
+        msleep(400);
+        { FILE * df = FIO_CreateFile("ML/LOGS/RWFULL.BIN");
+          if (df) { for (uint32_t o = 0; o < got; o += 0x40000u) FIO_WriteFile(df, (uint8_t *)stg + o, 0x40000u); FIO_CloseFile(df); } }
+        if (stg) fio_free(stg);
+        char tb[600]; int tn = 0;
+        tn += snprintf(tb + tn, sizeof(tb) - tn,
+            "FULL-FRAME grab. waited=%dms q=%d sg_done=%d w2=%dms stage=%dMB base=%08x got=%dMB\n"
+            "(read a3.. contiguous into RAM at quiescence, written as RWFULL.BIN after the shot freed the card)\n"
+            "first word per 16MB section (all non-0xAA/non-zero = whole frame captured live):\n",
+            waited, quiesced, sg_done, w2, (int)(stagesz >> 20), (unsigned)base, (int)(got >> 20));
+        tn += snprintf(tb + tn, sizeof(tb) - tn, "%s", fw);
         FILE * tf = FIO_CreateFile("ML/LOGS/STILLGRAB.TXT");
         if (tf) { FIO_WriteFile(tf, tb, tn); FIO_CloseFile(tf); }
         msleep(300);
         rawhk_on = 0; msleep(50);
         unpatch_memory(0xE05364B6);
-        NotifyBox(13000, "Full-frame grab done -> RWF*.BIN + STILLGRAB.TXT");
+        NotifyBox(13000, "Full-frame grab done -> RWFULL.BIN + STILLGRAB.TXT");
         return;
     }
     msleep(7000);   /* let every channel populate (raw LV or recording) */
