@@ -1712,24 +1712,45 @@ static void rawhk_task(void)
         /* Read the contiguous frame from idx24's live addr upward (a32df198 -> a3ffffff -> a4 .. a9), MMU-checked
          * per 1MB so an unmapped supersection stops us cleanly. NO SD I/O in this loop -> the whole grab into RAM
          * finishes (sub-second) BEFORE the camera RELEASEs/wipes the bank, so the tail isn't lost. */
-        uint32_t base = rawhk_addr[24] & ~0x40000000u, got = 0;
-        char fw[320]; int fn = 0;
+        uint32_t base = rawhk_addr[24] & ~0x40000000u, got0 = 0, total = 0;
+        char fw[460]; int fn = 0;
+        /* read CHUNK 0 (top of frame) NOW at quiescence -- guaranteed live. */
         if (stg && base)
-        {
             for (uint32_t o = 0; o < stagesz; o += 0x100000u)
             {
                 if (!A3_MAPPED(base + o)) break;
                 memcpy((uint8_t *)stg + o, (void *)UNCACHEABLE(base + o), 0x100000u);
-                got = o + 0x100000u;
+                got0 = o + 0x100000u;
             }
-            for (uint32_t o = 0; o < got; o += 0x1000000u)   /* first word at each 16MB -> which sections were live */
-                fn += snprintf(fw + fn, sizeof(fw) - fn, "  +%dMB %08x\n", (int)(o >> 20),
-                               (unsigned)*(volatile uint32_t *)((uint8_t *)stg + o));
-        }
         int w2 = 0; while (!sg_done && w2 < 12000) { msleep(50); w2 += 50; }   /* shot done -> card free */
         msleep(400);
-        { FILE * df = FIO_CreateFile("ML/LOGS/RWFULL.BIN");
-          if (df) { for (uint32_t o = 0; o < got; o += 0x40000u) FIO_WriteFile(df, (uint8_t *)stg + o, 0x40000u); FIO_CloseFile(df); } }
+        /* CHUNKED full-frame read: last run's persistence probe showed a3..a9 survive the shot, so REUSE this one
+         * ~32MB buffer to pull the WHOLE ~106MB frame in chunks. chunk0 is the live quiescence read; chunks 1.. are
+         * re-read post-shot from base + c*stagesz (relying on persistence) and appended to RWFULL.BIN. Per-chunk
+         * first word logged: a chunk that comes back 0xAA marks where Canon reclaimed the bank = the persistence
+         * limit -- if all chunks are live we have the full frame from a 32MB buffer, no 106MB alloc needed. */
+        FILE * df = FIO_CreateFile("ML/LOGS/RWFULL.BIN");
+        for (int c = 0; stg && c < 5; c++)
+        {
+            uint32_t got = got0;
+            if (c > 0)
+            {
+                uint32_t src = base + (uint32_t)c * stagesz; got = 0;
+                for (uint32_t o = 0; o < stagesz; o += 0x100000u)
+                {
+                    if (!A3_MAPPED(src + o)) break;
+                    memcpy((uint8_t *)stg + o, (void *)UNCACHEABLE(src + o), 0x100000u);
+                    got = o + 0x100000u;
+                }
+            }
+            if (!got) break;
+            if (df) for (uint32_t o = 0; o < got; o += 0x40000u) FIO_WriteFile(df, (uint8_t *)stg + o, 0x40000u);
+            fn += snprintf(fw + fn, sizeof(fw) - fn, "  chunk%d src=%08x got=%dMB first=%08x\n",
+                           c, (unsigned)(base + (uint32_t)c * stagesz), (int)(got >> 20), (unsigned)*(volatile uint32_t *)stg);
+            total += got;
+            if (got < stagesz) break;   /* last (partial) chunk -> hit the unmapped end of the frame */
+        }
+        if (df) FIO_CloseFile(df);
         if (ms) shoot_free_suite(ms); else if (stg) fio_free(stg);
         /* AFTER the shot + writes, re-probe a3..a9: if still mapped + non-0xAA, Canon holds the stills buffer well
          * past RELEASE -> a no-alloc "stream a3..a9 straight to card after the shot" path is also viable (fallback). */
@@ -1738,12 +1759,12 @@ static void rawhk_task(void)
             pzn += snprintf(pz + pzn, sizeof(pz) - pzn, "  post %08x map=%d first=%08x\n", (unsigned)bk, A3_MAPPED(bk),
                             (unsigned)(A3_MAPPED(bk) ? *(volatile uint32_t *)UNCACHEABLE(bk) : 0));
 #undef A3_MAPPED
-        char tb[760]; int tn = 0;
+        char tb[1000]; int tn = 0;
         tn += snprintf(tb + tn, sizeof(tb) - tn,
-            "FULL-FRAME grab. waited=%dms q=%d sg_done=%d w2=%dms alloc=%s stage=%dMB base=%08x got=%dMB\n"
-            "(read a3.. contiguous into RAM at quiescence, written as RWFULL.BIN after the shot freed the card)\n"
-            "first word per 16MB section (all non-0xAA/non-zero = whole frame captured live):\n",
-            waited, quiesced, sg_done, w2, ms ? "shoot" : "fio", (int)(stagesz >> 20), (unsigned)base, (int)(got >> 20));
+            "FULL-FRAME grab (chunked). waited=%dms q=%d sg_done=%d w2=%dms alloc=%s stage=%dMB base=%08x total=%dMB\n"
+            "32MB chunks re-read from the persisting bank post-shot, appended to RWFULL.BIN (0xAA first = where\n"
+            "Canon reclaimed the bank = persistence limit; all-live = full frame from a 32MB buffer):\n",
+            waited, quiesced, sg_done, w2, ms ? "shoot" : "fio", (int)(stagesz >> 20), (unsigned)base, (int)(total >> 20));
         tn += snprintf(tb + tn, sizeof(tb) - tn, "%s", fw);
         tn += snprintf(tb + tn, sizeof(tb) - tn, "a3..a9 AFTER shot (persistence = direct-write viability):\n%s", pz);
         FILE * tf = FIO_CreateFile("ML/LOGS/STILLGRAB.TXT");
