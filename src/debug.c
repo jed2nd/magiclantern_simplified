@@ -1604,24 +1604,9 @@ void rawhk_wrapper(uint32_t chan, uint32_t addr)
         rawhk_hits[chan]++;
         if (addr) rawhk_addr[chan] = addr;                    /* keep last non-zero (teardown writes 0) */
         if (chan == 24 && addr && rawhk_seqn < RAWHK_SEQ) rawhk_seq[rawhk_seqn++] = addr;   /* strip layout */
-        /* capture idx24's STILLS 2D geometry NOW (it's pointed at the a3 frame; SetEDmac programs geometry before
-         * the +0xa0 address, so the regs hold the stills config here -- by quiescence Canon has reused the block).
-         * pblock = idx24's reg block (0xd0487100); guard it's a real 0xd0xxxxxx block before reading. */
-        if (chan == 24 && (addr & 0xFF000000u) == 0xa3000000u && (pblock & 0xF0000000u) == 0xd0000000u)
-        {
-            rawhk_geo[0]  = *(volatile uint32_t *)(pblock + 0x54);   /* ynxn */
-            rawhk_geo[1]  = *(volatile uint32_t *)(pblock + 0x50);   /* ybxb */
-            rawhk_geo[2]  = *(volatile uint32_t *)(pblock + 0x4c);   /* yaxa */
-            rawhk_geo[3]  = *(volatile uint32_t *)(pblock + 0x48);   /* ysxs */
-            rawhk_geo[4]  = *(volatile uint32_t *)(pblock + 0x60);   /* off1a */
-            rawhk_geo[5]  = *(volatile uint32_t *)(pblock + 0x68);   /* off1b */
-            rawhk_geo[6]  = *(volatile uint32_t *)(pblock + 0x64);   /* off2a */
-            rawhk_geo[7]  = *(volatile uint32_t *)(pblock + 0x6c);   /* off2b */
-            rawhk_geo[8]  = *(volatile uint32_t *)(pblock + 0x70);   /* off3 */
-            rawhk_geo[9]  = *(volatile uint32_t *)(pblock + 0x58);   /* off1s */
-            rawhk_geo[10] = *(volatile uint32_t *)(pblock + 0x5c);   /* off2s */
-            rawhk_geo_rb  = pblock;
-        }
+        /* NB: reading idx24's geometry regs (0xd0487xxx +0x48..0x70) HERE -- during the live transfer -- HARD-FAULTS
+         * (confirmed: 2 crashes). 0xD0487xxx is only readable when idle, but by then Canon has reused the block.
+         * Geometry must come from the descriptor (param_2 of FUN_e05364c2) in RAM -- a separate, careful hook. */
     }
     *(volatile uint32_t *)(pblock + 0xa0) = addr;             /* replicate FUN_e05364b6 */
 }
