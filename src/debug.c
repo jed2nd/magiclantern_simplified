@@ -1859,6 +1859,35 @@ static void rawhk_task(void)
             if (got < stagesz) break;   /* last (partial) chunk -> hit the unmapped end of the frame */
         }
         if (df) FIO_CloseFile(df);
+        /* DECISIVE COLOR TEST: the DprawHeadToRaw struct @0x243ec names the TWO raw planes -- +0x34 = pre-Cogg
+         * (full-width, possibly the RGGB mosaic) chan, +0x30 = post-Cogg chan. idx24 is one of them and is proven
+         * mono/no-CFA. Read the OTHER plane's channel + grab its buffer (reuse the stage) to test for a real Bayer.
+         * All RAM reads (struct + rawhk_addr); MMU-checked memcpy so an unmapped bank can't fault. -> RWPRE.BIN */
+        uint32_t pl_pre  = *(volatile uint32_t *)0x00024420u & 0x7fu;   /* *(0x243ec+0x34) pre-Cogg chan idx */
+        uint32_t pl_post = *(volatile uint32_t *)0x0002441cu & 0x7fu;   /* *(0x243ec+0x30) post-Cogg chan idx */
+        uint32_t a_pre  = (pl_pre  < RAWHK_NCH) ? (rawhk_addr[pl_pre]  & ~0x40000000u) : 0;
+        uint32_t a_post = (pl_post < RAWHK_NCH) ? (rawhk_addr[pl_post] & ~0x40000000u) : 0;
+        uint32_t oaddr  = (a_pre && a_pre != base) ? a_pre : ((a_post && a_post != base) ? a_post : 0);
+        char plog[220]; int pn = 0;
+        pn += snprintf(plog + pn, sizeof(plog) - pn,
+            "PLANES (DprawHeadToRaw 0x243ec): idx24base=%08x | pre(+34) chan=%d a0=%08x | post(+30) chan=%d a0=%08x | grabbing OTHER=%08x\n",
+            (unsigned)base, (int)pl_pre, (unsigned)a_pre, (int)pl_post, (unsigned)a_post, (unsigned)oaddr);
+        if (oaddr >= 0x01000000u && oaddr < 0xc0000000u && stg)
+        {
+            FILE * pf = FIO_CreateFile("ML/LOGS/RWPRE.BIN");
+            if (pf)
+            {
+                uint32_t go = 0;
+                for (uint32_t o = 0; o < stagesz; o += 0x100000u)
+                {
+                    if (!A3_MAPPED(oaddr + o)) break;
+                    memcpy((uint8_t *)stg + o, (void *)UNCACHEABLE(oaddr + o), 0x100000u); go = o + 0x100000u;
+                }
+                if (go) for (uint32_t o = 0; o < go; o += 0x40000u) FIO_WriteFile(pf, (uint8_t *)stg + o, 0x40000u);
+                FIO_CloseFile(pf);
+            }
+        }
+        { FILE * plf = FIO_CreateFile("ML/LOGS/PLANES.TXT"); if (plf) { FIO_WriteFile(plf, plog, pn); FIO_CloseFile(plf); } }
         if (ms) shoot_free_suite(ms); else if (stg) fio_free(stg);
         /* AFTER the shot + writes, re-probe a3..a9: if still mapped + non-0xAA, Canon holds the stills buffer well
          * past RELEASE -> a no-alloc "stream a3..a9 straight to card after the shot" path is also viable (fallback). */
@@ -1940,7 +1969,7 @@ static void rawhk_task(void)
         fio_free(blob);
     }
 
-    static char b[3600]; int n = 0;
+    static char b[2900]; int n = 0;
     /* ML snprintf supports %d/%x/%08x only. */
     n += snprintf(b + n, sizeof(b) - n,
         "raw +0xa0 hook: total=%d  entry=%08x (hook ok if f000f8df)\n"
